@@ -1,0 +1,36 @@
+# ============================================================================
+# DeMoD Watchdog - Docker Build
+# ============================================================================
+# Copyright (c) 2024-2025 DeMoD LLC. All Rights Reserved. LICENSE BSD 3
+# ============================================================================
+
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    bash \
+    nftables \
+    sqlite \
+    gawk \
+    coreutils \
+    iproute2 \
+    jq \
+    python3 \
+    curl \
+    && rm -rf /var/cache/apk/*
+
+# Create directories
+RUN mkdir -p /data /scripts
+
+# Copy scripts
+COPY dcf-watchdog.sh /scripts/dcf-watchdog.sh
+COPY dcf-telemetry.sh /scripts/dcf-telemetry.sh
+
+RUN chmod +x /scripts/*.sh
+
+# Environment
+ENV DB_PATH=/data/identity.db
+ENV WEB_ROOT=/data/public
+ENV DCF_PORT=7777
+ENV LOG_LEVEL=info
+
+ENTRYPOINT ["/scripts/dcf-watchdog.sh"]
