@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # W2 -- revocation is enforced when the list becomes empty; a failed query keeps
 # the previous state and says so; an nft failure is never swallowed.
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"; t_start "$@"
 
 db=$TMP/id.db

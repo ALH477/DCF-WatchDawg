@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # W3 (address gate) and W5 (freshness) -- what ends up in the whitelist, end to end:
 # DB rows -> dcf-watchdog.sh -> a real nft.
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"; t_start "$@"
 
 db=$TMP/id.db
@@ -15,7 +16,7 @@ fi
 whitelist() {
     nft_reset
     mkdb "$db" "$@" || return $?
-    LAST_OUT=$(wd_once)
+    wd_once > "$TMP/last_out"
     set_elems whitelist | tr '\n' ' ' | sed 's/ $//'
 }
 
@@ -53,6 +54,7 @@ got=$(whitelist '["a","8.8.4.4\n9.9.9.9","now",0,0,0]')
 assert_eq "W3 newline: one DB value holding two addresses is one rejected value, not two whitelisted ones" "" "$got"
 
 got=$(whitelist '["a","8.8.4.4","now",0,0,0]' '["b","1.2.3.08","now",0,0,0]' '["c","127.0.0.1","now",0,0,0]' '["d","x","now",0,0,0]')
+LAST_OUT=$(cat "$TMP/last_out")
 if grep -Eq 'rejected 3\b' <<<"$LAST_OUT"; then ok "W3 the rejected count is logged"
 else bad "W3 the rejected count is logged (3 bad values)" "$LAST_OUT"; fi
 

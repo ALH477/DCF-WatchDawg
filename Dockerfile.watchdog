@@ -4,6 +4,18 @@
 # Copyright (c) 2024-2025 DeMoD LLC. All Rights Reserved. LICENSE BSD 3
 # ============================================================================
 
+# ---- stage 1: build dcf-gate from the vendored C (gate/). Needs a C compiler,
+# not exsc and not fasmg. The Makefile runs `dcf-gate selftest` as part of the
+# build, so an image whose gate answers wrongly does not get built.
+FROM alpine:3.21 AS gate
+RUN apk add --no-cache build-base
+WORKDIR /src
+COPY gate/ gate/
+RUN make -C gate LDFLAGS="-static-pie -Wl,-z,relro,-z,now" \
+ && ./gate/dcf-gate selftest
+
+# ---- stage 2: the runtime. curl and python3 are not installed: nothing here
+# uses them (jq validates status.json).
 FROM alpine:3.21
 
 RUN apk add --no-cache \
@@ -14,9 +26,13 @@ RUN apk add --no-cache \
     coreutils \
     iproute2 \
     jq \
-    python3 \
-    curl \
     && rm -rf /var/cache/apk/*
+
+# The single binary from stage 1. root-owned, not writable by anyone else: the
+# watchdog refuses to run a gate (or a telemetry script) that is.
+COPY --from=gate /src/gate/dcf-gate /usr/local/bin/dcf-gate
+RUN chmod 755 /usr/local/bin/dcf-gate \
+ && dcf-gate selftest
 
 # Create directories
 RUN mkdir -p /data /scripts
@@ -24,13 +40,19 @@ RUN mkdir -p /data /scripts
 # Copy scripts
 COPY dcf-watchdog.sh /scripts/dcf-watchdog.sh
 COPY dcf-telemetry.sh /scripts/dcf-telemetry.sh
+COPY dcf-healthcheck.sh /scripts/dcf-healthcheck.sh
 
-RUN chmod +x /scripts/*.sh
+RUN chmod 755 /scripts/*.sh
 
 # Environment
 ENV DB_PATH=/data/identity.db
 ENV WEB_ROOT=/data/public
 ENV DCF_PORT=7777
 ENV LOG_LEVEL=info
+
+# Healthy = the firewall chain still has its drop rule and, when telemetry is
+# enabled (TELEMETRY_SCRIPT=/scripts/dcf-telemetry.sh), status.json is fresh.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/scripts/dcf-healthcheck.sh"]
 
 ENTRYPOINT ["/scripts/dcf-watchdog.sh"]

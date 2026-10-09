@@ -18,7 +18,6 @@ T_DIR=$T_ROOT/tests
 WATCHDOG=${WATCHDOG:-$T_ROOT/dcf-watchdog.sh}
 TELEMETRY=${TELEMETRY:-$T_ROOT/dcf-telemetry.sh}
 T_PASS=0; T_FAIL=0; T_SKIP=0
-T_CASES=()
 
 t_detect_mode() {
     if [[ -z "${DCF_TEST_NFT_MODE:-}" ]]; then
@@ -66,7 +65,7 @@ t_cleanup() {
 }
 
 ok()   { T_PASS=$((T_PASS + 1)); echo "ok - $1"; }
-bad()  { T_FAIL=$((T_FAIL + 1)); echo "not ok - $1"; [[ -n "${2:-}" ]] && printf '%s\n' "$2" | sed 's/^/#   /' | head -${T_DETAIL_LINES:-25}; return 0; }
+bad()  { T_FAIL=$((T_FAIL + 1)); echo "not ok - $1"; [[ -n "${2:-}" ]] && printf '%s\n' "$2" | sed 's/^/#   /' | head -"${T_DETAIL_LINES:-25}"; return 0; }
 skip() { T_SKIP=$((T_SKIP + 1)); echo "skip - $1${2:+ ($2)}"; }
 
 # assert_eq NAME EXPECTED ACTUAL
@@ -100,9 +99,15 @@ wd_once() {
     DCF_WATCHDOG_ONCE=1 bash "$WATCHDOG" 2>&1
 }
 
-nft_reset() {   # empty the (netns-private) kernel ruleset
-    [[ "$DCF_TEST_NFT_MODE" == real ]] && nft flush ruleset
+nft_reset() {   # real: empty the (netns-private) kernel ruleset. shim: forget the recorded calls.
+    if [[ "$DCF_TEST_NFT_MODE" == real ]]; then nft flush ruleset; else : > "$NFT_SHIM_LOG"; fi
     return 0
+}
+
+# nft_untouched: nothing was ever installed / no nft call was made since nft_reset
+nft_untouched() {
+    if [[ "$DCF_TEST_NFT_MODE" == real ]]; then ! nft list table ip dcf_firewall >/dev/null 2>&1
+    else [[ ! -s "$NFT_SHIM_LOG" ]]; fi
 }
 
 set_elems() { python3 "$T_DIR/nftset.py" "$1"; }
@@ -123,6 +128,7 @@ fault_path() {
     NFT_FAULT_DIR=$TMP/fault; mkdir -p "$NFT_FAULT_DIR" "$TMP/fbin"
     export NFT_FAULT_DIR
     cp "$T_DIR/nft-fault.sh" "$TMP/fbin/nft"; chmod +x "$TMP/fbin/nft"
+    # shellcheck disable=SC2034  # read by the tests that source this file
     FAULT_PATH="$TMP/fbin:$PATH"
 }
 fault_reset() { find "$NFT_FAULT_DIR" -type f -delete; }

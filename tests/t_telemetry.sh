@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # W6 (and the telemetry half of W5) -- dcf-telemetry.sh as root writing into a web volume.
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"; t_start "$@"
 
 command -v jq >/dev/null || { echo "Bail out! jq not found"; exit 2; }
@@ -31,6 +32,22 @@ fresh_web
 echo PRECIOUS > "$TMP/victim"
 VICTIM=$TMP/victim WEB_ROOT=$web bash -c 'ln -s "$VICTIM" "$WEB_ROOT/.status.json.tmp.$$"; exec bash "$0"' "$TELEMETRY" >/dev/null 2>&1
 assert_eq "W6 symlink: a symlink pre-created at the old temp name does not redirect root's write" "PRECIOUS" "$(cat "$TMP/victim")"
+
+# ---- W6: a symlink already sitting at status.json is replaced, not followed
+fresh_web
+echo PRECIOUS > "$TMP/victim2"
+ln -s "$TMP/victim2" "$web/status.json"
+telemetry
+assert_eq "W6 a pre-existing status.json symlink is replaced, its target untouched" "PRECIOUS" "$(cat "$TMP/victim2")"
+if [[ -f "$web/status.json" && ! -L "$web/status.json" ]]; then ok "W6 ... and status.json is now a regular file"; else bad "W6 ... and status.json is now a regular file" "$(ls -la "$web")"; fi
+
+# ---- usernames are untrusted text too: sqlite -json must keep the document valid
+mkdb "$TMP/nasty.db" '["a\"quote","8.8.4.4","now",0,0,0]' '["back\\slash","8.8.4.5","now",0,0,0]' '["nl\nname","8.8.4.6","now",0,0,0]' '["ctl\u0001\u001f","8.8.4.7","now",0,0,0]' '["uni\u00e9\u65e5","8.8.4.8","now",0,0,0]'
+fresh_web
+telemetry DB_PATH="$TMP/nasty.db"
+names=$(status '[.peers[].username] | sort' | python3 -c 'import json,sys; print(json.dumps(sorted(json.load(sys.stdin))))' 2>&1)
+want=$(python3 -c 'import json; print(json.dumps(sorted(["a\"quote","back\\slash","nl\nname","ctl\u0001\u001f","uni\u00e9\u65e5"])))')
+assert_eq "usernames with quotes, backslashes, newlines, control characters and unicode survive as valid JSON" "$want" "$names"
 
 # ---- W6: the directory itself
 fresh_web
@@ -104,13 +121,13 @@ else bad "W6 TELEMETRY_PEERS=all (unknown) is refused with exit 64" "rc=$TRC"; f
 # ---- W6: the sqlite3 handle is read-only
 cat > "$TMP/shim/sqlite3" <<SH
 #!/bin/sh
-echo "\$@" >> "$TMP/sqlite3.argv"
+echo "\$1" >> "$TMP/sqlite3.argv"
 exec $(command -v sqlite3) "\$@"
 SH
 chmod +x "$TMP/shim/sqlite3"
 : > "$TMP/sqlite3.argv"
 fresh_web; telemetry PATH="$TMP/shim:$PATH"
-if [[ -s "$TMP/sqlite3.argv" ]] && ! grep -qv -e '-readonly' "$TMP/sqlite3.argv"; then ok "W6 every sqlite3 call in telemetry passes -readonly"
+if [[ -s "$TMP/sqlite3.argv" ]] && ! grep -qvx -e '-readonly' "$TMP/sqlite3.argv"; then ok "W6 every sqlite3 call in telemetry passes -readonly"
 else bad "W6 every sqlite3 call in telemetry passes -readonly" "$(cut -c1-120 "$TMP/sqlite3.argv")"; fi
 rm -f "$TMP/shim/sqlite3"
 

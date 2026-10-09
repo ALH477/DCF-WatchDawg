@@ -1,0 +1,4 @@
+gate/dcf-gate
+gate/*.o
+tests/
+.git

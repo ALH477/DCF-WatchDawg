@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # W1 -- the firewall is installed all-or-nothing, and a restart always repairs it.
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"; t_start "$@"
 
 db=$TMP/id.db
@@ -10,11 +11,11 @@ want=$'udp dport 7777 ip saddr @vip_permanent accept\nudp dport 7777 ip saddr @w
 
 if needs_real_nft "clean install: the chain is exactly VIP accept, whitelist accept, drop"; then
     nft_reset
-    out=$(wd_once); rc=$?
+    wd_once >/dev/null; rc=$?
     assert_eq "clean install exits 0" 0 "$rc"
     assert_eq "clean install: the chain is exactly VIP accept, whitelist accept, drop" "$want" "$(chain_rules)"
     assert_eq "clean install: policy accept (as before)" "policy accept" "$(chain_policy)"
-    out=$(wd_once); rc=$?
+    wd_once >/dev/null
     assert_eq "second start is idempotent: still exactly three rules" "$want" "$(chain_rules)"
 fi
 
@@ -51,6 +52,19 @@ if needs_real_nft "crash sweep"; then
     else bad "a kill at any point leaves no chain or a complete chain ($viol_b of $total points leave a partial one)" "$detail_b"; fi
 fi
 
+# ---- upgrading from a chain the OLD code left half-built (2 accepts, no drop)
+if needs_real_nft "upgrade from a half-built chain"; then
+    nft_reset
+    nft add table ip dcf_firewall
+    nft add chain ip dcf_firewall input '{ type filter hook input priority 0; policy accept; }'
+    nft add set ip dcf_firewall whitelist '{ type ipv4_addr; flags interval; timeout 1h; }'
+    nft add set ip dcf_firewall vip_permanent '{ type ipv4_addr; flags interval; }'
+    nft add rule ip dcf_firewall input udp dport 7777 ip saddr @vip_permanent accept
+    nft add rule ip dcf_firewall input udp dport 7777 ip saddr @whitelist accept
+    wd_once >/dev/null
+    assert_eq "a start on top of the old half-built chain (no drop) completes it" "$want" "$(chain_rules)"
+fi
+
 # ---- the idempotence guard used to be grep "udp dport $DCF_PORT": a substring match
 if needs_real_nft "port 777 after port 7777"; then
     nft_reset
@@ -60,19 +74,26 @@ if needs_real_nft "port 777 after port 7777"; then
         $'udp dport 777 ip saddr @vip_permanent accept\nudp dport 777 ip saddr @whitelist accept\nudp dport 777 drop' "$(chain_rules)"
 fi
 
-# ---- shim mode: all that can be checked is what is sent
+# ---- shim mode: all that can be checked is what is sent. [UNTESTED] against a kernel.
 if [[ "$DCF_TEST_NFT_MODE" == shim ]]; then
     : > "$NFT_SHIM_LOG"
     wd_once >/dev/null
-    log=$(cat "$NFT_SHIM_LOG")
-    n=$(grep -c '^STDIN-BEGIN' <<<"$log")
-    # the install must be ONE transaction carrying the chain, its three rules and the drop
-    tx=$(awk '/^STDIN-BEGIN/{b=1;next} /^STDIN-END/{b=0} b' <<<"$log" | grep -c . || true)
-    if grep -q 'ARGV: \[add\] \[rule\]' <<<"$log"; then
-        bad "firewall rules are installed in one nft -f transaction, not one 'nft add rule' at a time" "$(grep 'add\] \[rule' <<<"$log" | head -5)"
+    if grep -q 'ARGV: \[add\] \[rule\]' "$NFT_SHIM_LOG"; then
+        bad "(shim) the rules are installed in one 'nft -f' transaction, not one 'nft add rule' at a time" "$(grep -F '[add] [rule]' "$NFT_SHIM_LOG" | head -5)"
     else
-        ok "no per-rule 'nft add rule' calls"
+        ok "(shim) no per-rule 'nft add rule' calls"
     fi
+    # one STDIN block must carry the whole install: chain, flush, both accepts, the drop
+    if python3 - "$NFT_SHIM_LOG" <<'PY'
+import re, sys
+log = open(sys.argv[1]).read()
+blocks = re.findall(r"STDIN-BEGIN\n(.*?)\nSTDIN-END", log, re.S)
+need = ["add chain ip dcf_firewall input", "flush chain ip dcf_firewall input",
+        "udp dport 7777 ip saddr @vip_permanent accept", "udp dport 7777 ip saddr @whitelist accept", "udp dport 7777 drop"]
+sys.exit(0 if any(all(n in b for n in need) for b in blocks) else 1)
+PY
+    then ok "(shim) one transaction carries the chain, a flush, both accepts and the drop"
+    else bad "(shim) one transaction carries the chain, a flush, both accepts and the drop" "$(cat "$NFT_SHIM_LOG")"; fi
     skip "(shim) kernel state after a kill" "needs real nft"
 fi
 

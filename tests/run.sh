@@ -12,7 +12,6 @@
 # says so; shim mode checks what the scripts send, never what nft does.
 set -u
 cd "$(dirname "$0")/.." || exit 2
-root=$PWD
 
 if ! command -v sqlite3 >/dev/null 2>&1 && [[ -z "${DCF_TEST_NIX:-}" ]] && command -v nix >/dev/null 2>&1; then
     echo "# sqlite3 not found; fetching sqlite + shellcheck from nixpkgs"
@@ -62,7 +61,7 @@ if command -v shellcheck >/dev/null 2>&1 && [[ $# -eq 0 ]]; then
     echo "== shellcheck"
     files=(dcf-watchdog.sh dcf-telemetry.sh tests/*.sh)
     for f in dcf-healthcheck.sh scripts/*.sh; do [[ -f "$f" ]] && files+=("$f"); done
-    if shellcheck -x -s bash "${files[@]}"; then summary+=("ok   shellcheck"); else fail=1; summary+=("FAIL shellcheck"); fi
+    if shellcheck -x -P SCRIPTDIR -s bash "${files[@]}"; then summary+=("ok   shellcheck"); else fail=1; summary+=("FAIL shellcheck"); fi
 else
     summary+=("skip shellcheck (not installed, or a subset was requested)")
 fi

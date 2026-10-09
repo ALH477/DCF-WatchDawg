@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # W7 (log lines are valid JSON whatever they carry; TELEMETRY_SCRIPT is executed as
 # root only if it is a safe file).
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"; t_start "$@"
 
 db=$TMP/id.db
@@ -30,7 +31,7 @@ PY
 }
 json_check "log: double quote"              'say "hi"'
 json_check "log: backslash"                 'C:\dir\name'
-json_check "log: trailing backslash"        'ends with \'
+json_check "log: trailing backslash"        $'ends with \\'
 json_check "log: backslash then quote"      'a\"b'
 json_check "log: newline stays on one line" $'first\nsecond'
 json_check "log: a forged log line in a value" $'x"}\n{"level":"error","message":"forged"}'
@@ -45,7 +46,7 @@ marker=$TMP/ran
 mk() { printf '#!/bin/sh\necho ran >> "%s"\n' "$marker" > "$tdir/t.sh"; chmod "$1" "$tdir/t.sh"; chown "${2:-0}:${2:-0}" "$tdir/t.sh"; : > "$marker"; rm -f "$marker"; }
 ran() { [[ -e "$marker" ]]; }
 
-if needs_real_nft "TELEMETRY_SCRIPT cases"; then
+if true; then
     nft_reset; mk 755
     out=$(TELEMETRY_SCRIPT=$tdir/t.sh wd_once); rc=$?
     if ran; then ok "TS root-owned 0755 absolute script is run"; else bad "TS root-owned 0755 absolute script is run" "rc=$rc $out"; fi
@@ -72,11 +73,27 @@ if needs_real_nft "TELEMETRY_SCRIPT cases"; then
     if ran; then bad "TS script in a world-writable directory is NOT run as root" "rc=$rc"; else ok "TS script in a world-writable directory is NOT run as root"; fi
 
     nft_reset; mk 755
-    out=$(TELEMETRY_SCRIPT=$tdir/t.sh wd_once); rc=$?
-    ok_marker=$([[ -e "$marker" ]] && echo yes || echo no)
     nft_reset; mk 777
     out=$(TELEMETRY_SCRIPT=$tdir/t.sh wd_once); rc=$?
     if grep -q '"level":"error"' <<<"$out"; then ok "TS a refused script is logged as an error"; else bad "TS a refused script is logged as an error" "$out"; fi
+
+    # whoever can write ANY directory above the script can rename the one below it
+    nft_reset; mk 755
+    mkdir -m 777 "$TMP/gp"; mkdir -m 755 "$TMP/gp/inner"; cp "$tdir/t.sh" "$TMP/gp/inner/t.sh"; chmod 755 "$TMP/gp/inner/t.sh"
+    out=$(TELEMETRY_SCRIPT=$TMP/gp/inner/t.sh wd_once); rc=$?
+    if ran; then bad "TS script under a world-writable GRANDPARENT directory is NOT run as root" "rc=$rc"; else ok "TS script under a world-writable GRANDPARENT directory is NOT run as root"; fi
+    chmod 1777 "$TMP/gp"
+    out=$(TELEMETRY_SCRIPT=$TMP/gp/inner/t.sh wd_once); rc=$?
+    if ran; then ok "TS ... but a sticky root-owned directory above it (like /tmp) is accepted"; else bad "TS ... but a sticky root-owned directory above it (like /tmp) is accepted" "rc=$rc $out"; fi
+
+    # a symlink is judged by what it points to AND by the directory it sits in
+    nft_reset; mk 755; rm -f "$marker"
+    mkdir -m 755 "$TMP/lnk_ok"; ln -s "$tdir/t.sh" "$TMP/lnk_ok/t.sh"
+    out=$(TELEMETRY_SCRIPT=$TMP/lnk_ok/t.sh wd_once); rc=$?
+    if ran; then ok "TS a symlink to a safe script in a safe directory is run"; else bad "TS a symlink to a safe script in a safe directory is run" "rc=$rc $out"; fi
+    rm -f "$marker"; mkdir -m 777 "$TMP/lnk_bad"; ln -s "$tdir/t.sh" "$TMP/lnk_bad/t.sh"
+    out=$(TELEMETRY_SCRIPT=$TMP/lnk_bad/t.sh wd_once); rc=$?
+    if ran; then bad "TS a symlink sitting in a world-writable directory is NOT run" "rc=$rc"; else ok "TS a symlink sitting in a world-writable directory is NOT run"; fi
 
     # a script that fails is reported (as before)
     nft_reset; printf '#!/bin/sh\nexit 3\n' > "$tdir/t.sh"; chmod 755 "$tdir/t.sh"; chown 0:0 "$tdir/t.sh"

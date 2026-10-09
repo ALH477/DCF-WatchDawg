@@ -14,9 +14,11 @@ set -u
 dir=${NFT_FAULT_DIR:?}
 n=$(( $(cat "$dir/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$dir/count"
-printf '%s\t' "$n" >> "$dir/calls"
-printf '[%s] ' "$@" >> "$dir/calls"
-printf '\n' >> "$dir/calls"
+{
+    printf '%s\t' "$n"
+    printf '[%s] ' "$@"
+    printf '\n'
+} >> "$dir/calls"
 if [[ -n "${NFT_DIE_AT:-}" && "$n" -ge "$NFT_DIE_AT" ]]; then
     kill -KILL 0
     sleep 5
