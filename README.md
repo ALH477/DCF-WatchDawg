@@ -12,7 +12,7 @@ A lightweight daemon that synchronizes user authentication state with kernel-lev
 - **Telemetry Generation**: Produces `status.json` for dashboard consumption
 - **Low Overhead**: Shell-based, minimal resource usage
 - **Automatic Cleanup**: Expired sessions removed from whitelist; revoked users and VIPs are removed on the next sync
-- **Validated Input**: every address from the database and every configuration value goes through a gate (`gate/dcf-gate`, an Exsecutor unit compiled to C) before it reaches `nft`
+- **Validated Input**: every address from the database, every configuration value and every number published in `status.json` goes through a gate (`gate/dcf-gate`, Exsecutor units compiled to C) before it reaches `nft` or the JSON
 
 ## Quick Start
 
@@ -78,7 +78,7 @@ volumes:
 | `LOG_LEVEL` | `info` | Logging verbosity: exactly `debug`, `info`, `warn` or `error` (anything else: exit 64) |
 | `TELEMETRY_SCRIPT` | unset | Absolute path of the telemetry script to run each cycle (in the image: `/scripts/dcf-telemetry.sh`). Unset: no telemetry. It must be a file only root can change (see below) |
 | `TELEMETRY_PEERS` | `names` | What `status.json` says about users: `names` (name, tier, VIP flag, online), `count` (totals only), `off` (nothing). **`names` publishes every username to whoever can read `status.json`** |
-| `DCF_GATE` | `/usr/local/bin/dcf-gate`, then `gate/dcf-gate` beside the script | Path of the gate binary |
+| `DCF_GATE` | `/usr/local/bin/dcf-gate`, then `gate/dcf-gate` beside the script | Path of the gate binary (both scripts use it). If set, it is the only candidate: a wrong path is an error (exit 69), not a fallback |
 | `DCF_WATCHDOG_ONCE` | unset | `1`: run exactly one init + sync cycle, then exit (0, or 1 if a sync failed). For tests |
 
 `DCF_PORT` must be 1..65535 and `SYNC_INTERVAL` 1..3600 seconds, decimal, no sign,
@@ -90,7 +90,8 @@ touches the firewall and exits **64** if either (or `LOG_LEVEL`, or
 an absolute path to an executable regular file owned by root (or the running
 user) that nobody else can write, in a directory chain that nobody else can
 rename entries in (a root-owned sticky directory such as `/tmp` is accepted).
-The check runs at start and again every cycle. Otherwise it is refused and an
+The check runs at start and again every cycle (for the telemetry script; the gate is
+checked once per process start). Otherwise it is refused and an
 `error` is logged.
 
 ## How It Works
@@ -196,10 +197,11 @@ Generates `/data/public/status.json` when `TELEMETRY_SCRIPT` is set:
 With `TELEMETRY_PEERS=count` the `peers` array is empty and a
 `"peer_counts": {"total": 3, "online": 2}` object follows it; with `off`, `peers`
 is empty and nothing else is said about users. Every number in the file is
-checked against the JSON number grammar before it is written (a bad reading is
-published as `0`, with a note on stderr), `WEB_ROOT` must be a real directory
+checked by `dcf-gate number` / `dcf-gate load` (JSON's grammar: no sign, no exponent,
+no leading zero, at most 20 digits; a load average has at most 6+6) before it is
+written (a bad reading is published as `0`, with a note on stderr), `WEB_ROOT` must be a real directory
 owned by the running user that nobody else can write (otherwise the script
-refuses), the file is written through `mktemp` and renamed into place with mode
+refuses; a trailing slash does not hide a symlink), the file is written through `mktemp` and renamed into place with mode
 644, and the database is opened read-only. "online" means seen in the last five
 minutes, compared as instants.
 
@@ -287,7 +289,7 @@ the ids are the findings they answer):
 | W3 | `validate_ipv4` accepted `1.2.3.08` (bash arithmetic on `08` errors and the error reads as "not above 255"); nft then rejected the whole batch, silently, and the whitelist stopped updating for everyone; `010.2.3.4` passed and nft read it as octal, **8.2.3.4**; whitespace was stripped from inside the value; loopback, multicast, `0.0.0.0` and broadcast were whitelisted | `last_ip` goes to `dcf-gate` byte for byte (as hex, so a newline or NUL inside a value cannot split or truncate it). Only canonical dotted quads of the global, private and shared classes pass; nothing is stripped; duplicates collapse; at most 4096 addresses per batch (the rest are counted and logged at `error`); rejected counts are logged |
 | W4 | `DCF_PORT="7777 accept #"` turned all three rules into an unconditional accept (nft joins its argument words and `#` starts a comment); `SYNC_INTERVAL=0` busy-looped (67 syncs in 2 s measured); `LOG_LEVEL` unchecked | `DCF_PORT`, `SYNC_INTERVAL`, `LOG_LEVEL` are validated first; a bad value exits 64 before nft is touched |
 | W5 | `last_seen >= datetime('now','-1 hour')` compared RFC 3339 text (`...T...+00:00`) with SQLite's `YYYY-MM-DD HH:MM:SS` as strings: `T` sorts above the space, so any row dated today looked fresh, and `last_seen = 'garbage'` did too | `datetime(last_seen) >= datetime('now','-1 hour')`; NULL and unparseable values are stale. The same fix for "online" in the telemetry |
-| W6 | temp file `.status.json.tmp.$$` (predictable) written by root into the web volume through `cat >` (follows a pre-created symlink); `status.json` always listed every username; numbers from `/proc`, `free`, `/sys` and `nft` were pasted into the JSON unchecked | `mktemp` (unpredictable name, 0600), `WEB_ROOT` must be a real directory owned by the running user and not group/world-writable (else exit 1; this is stricter than the symlink check alone, deliberately), numbers validated, `TELEMETRY_PEERS=names\|count\|off` (default `names`, unchanged), `sqlite3 -readonly` |
+| W6 | temp file `.status.json.tmp.$$` (predictable) written by root into the web volume through `cat >` (follows a pre-created symlink); `status.json` always listed every username; numbers from `/proc`, `free`, `/sys` and `nft` were pasted into the JSON unchecked | `mktemp` (unpredictable name, 0600), `WEB_ROOT` must be a real directory owned by the running user and not group/world-writable (else exit 1; this is stricter than the symlink check alone, deliberately), numbers validated by `dcf-gate`, `TELEMETRY_PEERS=names\|count\|off` (default `names`, unchanged), `sqlite3 -readonly` |
 | W7 | log lines were built by interpolation (a quote, backslash or newline in a value broke the JSON or forged a second record); `TELEMETRY_SCRIPT` ran as root if it was merely executable; the image carried `curl` and `python3` unused, built nothing, had no health check, and the README asked for `NET_RAW` | `log()` escapes `"`, `\`, newline, CR, tab and all other control characters; `TELEMETRY_SCRIPT` must pass the file check above (and exit 64 at start if not); multi-stage Dockerfile building the single static `dcf-gate`, no `curl`/`python3`, `HEALTHCHECK` (`dcf-healthcheck.sh`); README no longer asks for `NET_RAW` |
 
 Other behaviour a caller may notice: the first sync now happens once, at the top
@@ -341,10 +343,22 @@ scripts *send*, skips the rest and says so. Each test file prints its mode.
 ## What was run, and what was not
 
 Run (mode `real`, nft 1.0.9, kernel 6.18, bash 5.2, sqlite3 CLI 3.53.3 and
-python's libsqlite 3.45.1, jq 1.7, shellcheck 0.11): `tests/run.sh`, whole suite,
-see the commit that finishes this work for the totals; the tests for W1-W7 were
-written first and **failed** on the unmodified scripts (94 failing checks), then
-passed after the fixes. Also measured, with the real nft in a namespace:
+python's libsqlite 3.45.1, jq 1.7, shellcheck 0.11, gcc 13):
+
+* `tests/run.sh` (everything): **340 checks pass, 0 fail, 0 skip** (2.5 minutes).
+  `DCF_TEST_NFT_MODE=shim tests/run.sh` on the nft-dependent files: 113 pass, 0 fail,
+  10 skipped as needing a real nft.
+* The tests for W1-W7 were written first and **failed** on the unmodified
+  scripts: 94 of the 131 checks that existed when they were first committed
+  (commit `1749a8f`), and 104 of the 146 in the same six files as they stand now
+  (`WATCHDOG=` and `TELEMETRY=` point the suite at any copy of the scripts; the
+  old copies are `git show 1749a8f:dcf-watchdog.sh` and `...:dcf-telemetry.sh`).
+  They pass after the fixes.
+* Exsecutor's own suites for the two vendored units, against the compiler build
+  recorded in `gate/PROVENANCE.md`: `examples/dcf_net_gate/proba_c.sh` and
+  `examples/watchdawg_gate/proba_c.sh` (the second: 696,610 cases, 16 mutants).
+
+Also measured, with the real nft in a namespace:
 
 * nft **rejects** `1.2.3.08` ("Could not resolve hostname"); it **accepts**
   `1.2.3.4 ` with a trailing space and `01.2.3.4`; it reads `010.2.3.4` as
@@ -362,21 +376,24 @@ Not run:
 * `[UNTESTED]` the Docker image: there is no docker here. The Dockerfile's build
   (musl, `-static-pie`) and `HEALTHCHECK` are unbuilt; the same `make` was
   linked `-static-pie` against glibc and `dcf-healthcheck.sh` is tested directly.
-* `[UNTESTED]` Alpine's own versions (sqlite 3.48, nftables 1.0.9 is the one
-  measured, bash 5.2).
+* `[UNTESTED]` the versions Alpine 3.21 ships for sqlite, nftables and bash (the
+  measurements above are from this machine's nft 1.0.9 and bash 5.2, and the two
+  SQLite builds named).
 * `[UNTESTED]` a database in WAL mode opened `-readonly` by a root with
   `--cap-drop ALL` (no `DAC_OVERRIDE`): a database file or directory that only
   its writer (DCF-ID's uid) can read will not be readable. The test used a 0644
   database owned by uid 1000.
 * `[UNTESTED]` more than one watchdog on one host, and the daemon's signal
-  handling (`SIGTERM` during a `sleep` is delivered when the sleep ends, as
-  before).
-* The vendored gate was exercised here through the CLI only
-  (`tests/t_gate_cli.py`: 99,067-candidate corpus, hostile inputs, framing,
-  1 MiB lines, 150,000 lines, ASan+UBSan; `tests/t_gate_mutants.py`: 21 host
-  mutants, all killed). Its own differential suite (1,042,480 cases, 14 gate
-  mutants) is Exsecutor's `examples/dcf_net_gate/proba_c.sh`; it was run
-  against the same compiler build as the vendored C and passed.
+  handling (the `trap` moved into `main`; nothing here sends it a signal).
+* The vendored gates were exercised **here** through the CLI only
+  (`tests/t_gate_cli.py`: a 99,067-candidate IPv4 corpus against a three-way
+  oracle, number and load corpora, hostile inputs, framing, 1 MiB lines, 150,000
+  lines, ASan+UBSan; `tests/t_gate_mutants.py`: 24 one-line mutants of the host,
+  all built and all killed).
+* `[UNTESTED]` packet-level continuity: that no packet sees the chain between
+  the old rules and the new ones during the start-up transaction. It follows from
+  nft's transaction semantics (one netlink batch, committed atomically); no
+  traffic was sent. What was tested is the state after a kill at every nft call.
 
 Known limits, unchanged:
 
