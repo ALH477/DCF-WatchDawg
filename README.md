@@ -79,6 +79,8 @@ volumes:
 | `TELEMETRY_SCRIPT` | unset | Absolute path of the telemetry script to run each cycle (in the image: `/scripts/dcf-telemetry.sh`). Unset: no telemetry. It must be a file only root can change (see below) |
 | `TELEMETRY_PEERS` | `names` | What `status.json` says about users: `names` (name, tier, VIP flag, online), `count` (totals only), `off` (nothing). **`names` publishes every username to whoever can read `status.json`** |
 | `DCF_GATE` | `/usr/local/bin/dcf-gate`, then `gate/dcf-gate` beside the script | Path of the gate binary (both scripts use it). If set, it is the only candidate: a wrong path is an error (exit 69), not a fallback |
+| `DCF_PATH` | unset | Colon-separated absolute directories that replace the pinned `PATH` (`/usr/sbin:/usr/bin:/sbin:/bin`), for a system that keeps `nft`, `sqlite3` and friends elsewhere. Each must be a directory only root can change (exit 69 otherwise) |
+| `DCF_QUERY_TIMEOUT` | `10` | Seconds a database query may take (1..3600, checked by the gate) before it counts as failed |
 | `DCF_WATCHDOG_ONCE` | unset | `1`: run exactly one init + sync cycle, then exit (0, or 1 if a sync failed). For tests |
 
 `DCF_PORT` must be 1..65535 and `SYNC_INTERVAL` 1..3600 seconds, decimal, no sign,
@@ -145,22 +147,53 @@ unreadable keeps the last VIP list until a sync succeeds.
 
 ### Firewall Rules
 
-One `nft -f -` transaction on every start (all or nothing; safe to re-run):
+**The table `dcf_firewall` belongs to the daemon and is rebuilt at every start**, in
+one `nft -f -` transaction:
 
 ```
+add table ip dcf_firewall              # so that the next line cannot fail with "no such table"
+delete table ip dcf_firewall
 add table ip dcf_firewall
 add chain ip dcf_firewall input { type filter hook input priority 0; policy accept; }
 add set ip dcf_firewall whitelist { type ipv4_addr; flags interval; timeout 1h; }
 add set ip dcf_firewall vip_permanent { type ipv4_addr; flags interval; }
-flush chain ip dcf_firewall input
 add rule ip dcf_firewall input udp dport 7777 ip saddr @vip_permanent accept
 add rule ip dcf_firewall input udp dport 7777 ip saddr @whitelist accept
 add rule ip dcf_firewall input udp dport 7777 drop
+add element ip dcf_firewall vip_permanent { ... }     # only if the database says so
+add element ip dcf_firewall whitelist { ... }
 ```
 
-The chain is rebuilt from scratch each start, so it is always exactly these three
-rules for the current `DCF_PORT`; the sets keep their elements. The chain is the
-watchdog's: rules added to it by hand are removed at the next start.
+Whatever was in the old table (a set with other flags, a chain on another hook or
+priority, extra chains, sets or rules, an `accept` ahead of ours) is deleted with
+it, so none of it can make the install fail or leave the port open. Tables with
+other names are not touched. Do not keep your own rules in `dcf_firewall`.
+
+**What a restart does to the dynamic sets.** The batch is atomic: a packet is judged
+by the old ruleset or by the new one, never by none. The new sets are not empty: the
+daemon reads the database just before and puts both sets' contents in the same
+batch, so nobody waits for the first sync. Measured (netns, real nft): 21 restarts
+back to back (about 220 ms each, i.e. 21 deletions and rebuilds of the table) while
+3,320 numbered datagrams per source flowed to the port: the whitelisted source
+lost **0 of 3,320**; the source that was not whitelisted got **0 of 3,320** through
+(`tests/t_firewall.sh` runs the same with 10 restarts). Two limits:
+
+* if the database cannot be read at that moment (missing, corrupt, locked, or no
+  answer within `DCF_QUERY_TIMEOUT` seconds, default 10), the sets come up **empty**:
+  the drop rule is in force, nobody is let in, and the loop's first cycle retries.
+  Before this change a restart on top of an unreadable database kept the old
+  elements; it no longer can, because the sets are new. (Once running, a cycle
+  that cannot read the database still keeps the previous sets: fail-static.)
+* the drop rule waits for those queries, at most `DCF_QUERY_TIMEOUT` seconds each
+  (two at start). Until the install commits, the previous ruleset, or the host's own
+  policy if there was none, applies.
+
+**If the install is still refused** (no `nft`, no `CAP_NET_ADMIN`, a kernel without
+nf_tables) the batch changed nothing; the daemon logs nft's own error, says that
+the host's own firewall policy stays in force and that the UDP port is **not
+protected by this daemon**, and exits 1. The port is then exactly as open as it was
+before the daemon started. Run it under a supervisor that restarts it, and watch
+the health check.
 
 ## Telemetry Output
 
@@ -247,6 +280,8 @@ User flow:
 ```bash
 # Build the gate once, then run directly (requires root for nftables)
 make -C gate
+# (on a system that keeps nft/sqlite3 outside /usr/sbin:/usr/bin:/sbin:/bin, add
+#  DCF_PATH=/dir/with/nft:/dir/with/sqlite3:... ; each must be root-only)
 sudo DB_PATH=/path/to/identity.db \
      WEB_ROOT=/var/www/html \
      DCF_PORT=7777 \
@@ -284,7 +319,7 @@ the ids are the findings they answer):
 
 | id | before | now |
 |---|---|---|
-| W1 | rules added one `nft add rule` at a time behind a `grep "udp dport $DCF_PORT"`; a kill between the accept rules and the `drop` left a chain that accepts, and every later start saw the grep hit and never added the drop; port 777 matched 7777 | one `nft -f -` transaction per start (table, chain, sets, `flush chain`, the three rules). All or nothing, re-runnable, and a start on top of a half-built chain completes it. The chain is rebuilt each start (see "Firewall Rules") |
+| W1 | rules added one `nft add rule` at a time behind a `grep "udp dport $DCF_PORT"`; a kill between the accept rules and the `drop` left a chain that accepts, and every later start saw the grep hit and never added the drop; port 777 matched 7777 | the table is rebuilt in one `nft -f -` transaction per start (see "Firewall Rules"): all or nothing, re-runnable, a start on top of a half-built chain completes it |
 | W2 | `vip_permanent` was only rewritten while at least one VIP remained: the last revoked VIP stayed whitelisted forever; nft errors were discarded (`2>/dev/null`, `\|\| true`) | both sets are reconciled every cycle (VIP was every 6th: revocation now takes one `SYNC_INTERVAL`, not six). A successful empty result flushes; a failed query or gate keeps the previous set and logs `error`; every nft failure is logged with nft's own text (bounded) |
 | W3 | `validate_ipv4` accepted `1.2.3.08` (bash arithmetic on `08` errors and the error reads as "not above 255"); nft then rejected the whole batch, silently, and the whitelist stopped updating for everyone; `010.2.3.4` passed and nft read it as octal, **8.2.3.4**; whitespace was stripped from inside the value; loopback, multicast, `0.0.0.0` and broadcast were whitelisted | `last_ip` goes to `dcf-gate` byte for byte (as hex, so a newline or NUL inside a value cannot split or truncate it). Only canonical dotted quads of the global, private and shared classes pass; nothing is stripped; duplicates collapse; at most 4096 addresses per batch (the rest are counted and logged at `error`); rejected counts are logged |
 | W4 | `DCF_PORT="7777 accept #"` turned all three rules into an unconditional accept (nft joins its argument words and `#` starts a comment); `SYNC_INTERVAL=0` busy-looped (67 syncs in 2 s measured); `LOG_LEVEL` unchecked | `DCF_PORT`, `SYNC_INTERVAL`, `LOG_LEVEL` are validated first; a bad value exits 64 before nft is touched |
@@ -292,7 +327,30 @@ the ids are the findings they answer):
 | W6 | temp file `.status.json.tmp.$$` (predictable) written by root into the web volume through `cat >` (follows a pre-created symlink); `status.json` always listed every username; numbers from `/proc`, `free`, `/sys` and `nft` were pasted into the JSON unchecked | `mktemp` (unpredictable name, 0600), `WEB_ROOT` must be a real directory owned by the running user and not group/world-writable (else exit 1; this is stricter than the symlink check alone, deliberately), numbers validated by `dcf-gate`, `TELEMETRY_PEERS=names\|count\|off` (default `names`, unchanged), `sqlite3 -readonly` |
 | W7 | log lines were built by interpolation (a quote, backslash or newline in a value broke the JSON or forged a second record); `TELEMETRY_SCRIPT` ran as root if it was merely executable; the image carried `curl` and `python3` unused, built nothing, had no health check, and the README asked for `NET_RAW` | `log()` escapes `"`, `\`, newline, CR, tab and all other control characters; `TELEMETRY_SCRIPT` must pass the file check above (and exit 64 at start if not); multi-stage Dockerfile building the single static `dcf-gate`, no `curl`/`python3`, `HEALTHCHECK` (`dcf-healthcheck.sh`); README no longer asks for `NET_RAW` |
 
-Other behaviour a caller may notice: the first sync now happens once, at the top
+A second review (packets, real nft) found one regression and four smaller things; fixed:
+
+| id | before | now |
+|---|---|---|
+| R1 | the first version of the atomic install used `add set` / `add chain` and so *failed* ("File exists") on a pre-existing `dcf_firewall` table whose set had other flags or whose chain sat on another hook or priority; no drop rule was installed and a datagram from a non-whitelisted source arrived. The original's `if ! nft list ...` guards would have installed it | **the table `dcf_firewall` is owned by the daemon and is rebuilt at start**: `delete` + recreate in the same transaction, with the sets' initial contents in it (see "Firewall Rules"). A failed install says that the port is left as the host's policy has it |
+| R2 | `data_used <= FREE_BYTES` treated usage below zero as "under the free tier", and a text `data_used` or text `account_balance` compared as larger than any number, so a corrupt row could be whitelisted | usage and balance are compared only when `typeof` is integer or real; usage must be `>= 0`; VIP stays unconditional, NULL stays a refusal |
+| R3 | both scripts trusted the launcher's `PATH`, `BASH_ENV`, `ENV`, `LD_PRELOAD`: a hostile launcher environment was root code execution | `PATH` is pinned to `/usr/sbin:/usr/bin:/sbin:/bin` (or to `DCF_PATH`, each entry checked like the gate's directory); `BASH_ENV`, `ENV`, `CDPATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` are unset for everything the scripts start; `IFS` is reset. The image starts the daemon as `bash -p` so bash itself does not read `BASH_ENV` either |
+| R4 | the telemetry script published without checking if neither `jq` nor `python3` was installed; the health check judged `DCF_PORT` by a pattern that accepted up to 99999 | no validator, no publication (exit 1); the health check asks `dcf-gate` like the daemon does |
+| R5 | a username holding bytes that are not UTF-8 (only possible by corrupting the database) passes `jq` validation | with `python3` as the validator it is now refused (strict UTF-8); with `jq`, which the image uses, it is **still published**. `[OPEN]` |
+
+The shared code that decides what the root scripts trust (`dir_chain_safe`,
+`safe_exec_file`, `find_gate`, `harden_env`) now lives in `dcf-common.sh`, sourced
+by the three scripts from their own directory (it is not executable; the image
+copies it to `/scripts`). A refused directory is named with the command that fixes
+it, e.g. `directory /opt/dcf/gate is writable by group or others (mode 775); fix:
+chmod g-w,o-w /opt/dcf/gate`. This is what a checkout or an archive extracted under
+`umask 002` runs into: `chmod -R g-w,o-w` the tree.
+
+Other behaviour a caller may notice: **the table `dcf_firewall` is owned by the
+daemon and is rebuilt at start** (anything else in it is deleted; see "Firewall
+Rules"); a restart on top of an unreadable database brings both sets up empty
+instead of keeping the previous elements; a database query that takes longer than
+`DCF_QUERY_TIMEOUT` (10 s) fails; `PATH` is pinned (R3); the first sync now
+happens once, at the top
 of the loop (it used to run once before the loop and again at its first turn);
 a failed sync no longer ends the process at startup, it is logged and retried;
 `init_firewall` no longer says "Created table/chain/set" (one line says the
@@ -399,18 +457,21 @@ Known limits, unchanged:
 
 * The chain is `ip` (IPv4) only. UDP over IPv6 is not filtered by this table at
   all. `[OPEN]`
-* `policy accept` with a `drop` for one port: while the watchdog has not yet
-  installed its ruleset (or after someone deletes the table), the port is open.
-  The health check notices a missing drop rule; nothing re-installs it until the
-  next start.
+* `policy accept` with a `drop` for one port: until the daemon's transaction has
+  committed (and after someone deletes the table), the port is as open as the
+  host's own policy leaves it. The health check notices a missing drop rule;
+  nothing re-installs it until the next start.
 * A `last_seen` in the future counts as fresh. `[OPEN]`
 * `log()` escapes control characters, quote and backslash but does not validate
   UTF-8: bytes that are not valid UTF-8 pass through (everything the watchdog
   itself logs from the database is ASCII-escaped by the gate). `[OPEN]`
-* A pre-existing `dcf_firewall` chain with a different hook priority, or a set
-  with different flags, makes the install transaction fail (nft: "File exists");
-  the failure is logged and the start is refused. Delete the table
-  (`nft delete table ip dcf_firewall`) to let the watchdog recreate it.
+* The directories *above* `WEB_ROOT` are not checked by the telemetry script (a
+  volume root has to be writable by whoever writes the database), so the
+  guarantee is about `WEB_ROOT` itself; the script re-identifies it (device and
+  inode) just before the rename, which narrows the window and does not close it.
+* BASH_ENV and ENV are read by bash *before* the script's first line. The scripts
+  keep them away from everything they start; for the daemon's own shell, start it
+  as `bash -p` (the image does) or from a clean environment.
 * Licence: the vendored C is derived from GPL-3.0-or-later Exsecutor source.
   Whether it may ship in this BSD-3-Clause repository is the owner's decision,
   **pending** (`gate/PROVENANCE.md`).
