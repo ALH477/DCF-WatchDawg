@@ -259,8 +259,19 @@ main() {
             "$TELEMETRY_SCRIPT" 2>/dev/null || log_warn "Telemetry script failed"
         fi
         
+        # Test hook: stop after the first full cycle (init, startup sync, one
+        # loop iteration including telemetry).
+        if [[ "${DCF_WATCHDOG_ONCE:-}" == "1" ]]; then
+            log_info "DCF_WATCHDOG_ONCE set: single cycle done"
+            exit 0
+        fi
+
         sleep "$SYNC_INTERVAL"
     done
 }
 
-main "$@"
+# Run only when executed; sourcing (the test suite does) defines the functions
+# and nothing else.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
