@@ -69,7 +69,7 @@ fi
 # lint, when shellcheck is around (and the whole suite was asked for)
 if command -v shellcheck >/dev/null 2>&1 && [[ $# -eq 0 ]]; then
     echo "== shellcheck"
-    files=(dcf-watchdog.sh dcf-telemetry.sh tests/*.sh)
+    files=(dcf-watchdog.sh dcf-telemetry.sh dcf-common.sh tests/*.sh)
     for f in dcf-healthcheck.sh scripts/*.sh; do [[ -f "$f" ]] && files+=("$f"); done
     if shellcheck -x -P SCRIPTDIR -s bash "${files[@]}"; then summary+=("ok   shellcheck"); else fail=1; summary+=("FAIL shellcheck"); fi
 else

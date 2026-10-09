@@ -70,6 +70,12 @@ for good in debug info warn error; do
     run "LOG_LEVEL=$good"; assert_eq "W4 LOG_LEVEL=$good starts" 0 "$RC"
 done
 
+for bad in 0 abc -1 3601 "1 2"; do
+    run "DCF_QUERY_TIMEOUT=$bad"; assert_eq "W4 DCF_QUERY_TIMEOUT='$bad' is refused with exit 64" 64 "$RC"
+done
+nft_reset
+run DCF_QUERY_TIMEOUT=5; assert_eq "DCF_QUERY_TIMEOUT=5 starts" 0 "$RC"
+
 # the gate: an explicit DCF_GATE that is missing or unsafe is refused (69), never replaced by another
 nft_reset
 run DCF_GATE=/nonexistent/dcf-gate; assert_eq "gate: a missing DCF_GATE is refused with exit 69" 69 "$RC"

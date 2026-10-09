@@ -15,13 +15,28 @@
 # ============================================================================
 set -euo pipefail
 
+# This script's directory, by builtins only (see dcf-common.sh)
+_src="${BASH_SOURCE[0]}"
+[[ "$_src" == */* ]] && _src="${_src%/*}" || _src=.
+SCRIPT_DIR="$(cd "$_src" && pwd)"
+readonly SCRIPT_DIR
+unset _src
+# shellcheck source=dcf-common.sh
+. "$SCRIPT_DIR/dcf-common.sh"
+
+unhealthy() { echo "unhealthy: $*"; exit 1; }
+
+harden_env || unhealthy "$SAFE_WHY"
+
 DCF_PORT="${DCF_PORT:-7777}"
 SYNC_INTERVAL="${SYNC_INTERVAL:-10}"
 WEB_ROOT="${WEB_ROOT:-/var/lib/demod/public}"
 
-unhealthy() { echo "unhealthy: $*"; exit 1; }
-
-[[ "$DCF_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || unhealthy "DCF_PORT '${DCF_PORT:0:20}' is not a port"
+# the same gate, and the same judgement of DCF_PORT, as the daemon's
+find_gate || unhealthy "$GATE_WHY"
+if ! err=$("$GATE_BIN" port "$DCF_PORT" 2>&1 >/dev/null); then
+    unhealthy "DCF_PORT '${DCF_PORT:0:20}' refused by dcf-gate: ${err:0:120}"
+fi
 
 chain=$(nft list chain ip dcf_firewall input 2>&1) || unhealthy "no dcf_firewall input chain: ${chain:0:120}"
 grep -Eq "^[[:space:]]*udp dport $DCF_PORT drop[[:space:]]*$" <<<"$chain" ||

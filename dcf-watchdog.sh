@@ -46,9 +46,19 @@ readonly SYNC_INTERVAL="${SYNC_INTERVAL:-10}"
 readonly LOG_LEVEL="${LOG_LEVEL:-info}"
 # At most this many addresses go into one nft batch (dcf-gate --max).
 readonly MAX_BATCH=4096
+# A database query that has not answered in this many seconds is a failed query.
+# The firewall install waits for the first one, so it must not wait forever.
+readonly QUERY_TIMEOUT="${DCF_QUERY_TIMEOUT:-10}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This script's directory, by builtins only: no external program runs before
+# harden_env has pinned PATH.
+_src="${BASH_SOURCE[0]}"
+[[ "$_src" == */* ]] && _src="${_src%/*}" || _src=.
+SCRIPT_DIR="$(cd "$_src" && pwd)"
 readonly SCRIPT_DIR
+unset _src
+# shellcheck source=dcf-common.sh
+. "$SCRIPT_DIR/dcf-common.sh"
 
 # Exit statuses for refusing to start (sysexits.h)
 readonly EX_USAGE=64        # a configuration value was refused
@@ -108,72 +118,9 @@ log_debug() { log "debug" "$@"; }
 # ============================================================================
 # VALIDATION
 # ============================================================================
-# The one definition of "an address", "a port" and "an interval" is the
-# vendored gate. Locate it, and refuse a gate that someone else could replace.
-DCF_GATE_BIN=""
-SAFE_WHY=""
-
-# dir_chain_safe DIR -> 0 if DIR and every directory above it is owned by uid 0
-# or the running user and cannot be written by group or others. (Whoever can
-# write one of them can rename the directory below it and put their own file
-# where ours was.) A world-writable directory is accepted only if it is root's
-# and sticky, like /tmp: there nobody can rename entries they do not own.
-dir_chain_safe() {
-    local d="$1" downer dmode
-    while :; do
-        read -r downer dmode < <(stat -L -c '%u %a' -- "$d") || { SAFE_WHY="cannot stat $d"; return 1; }
-        if (( downer != 0 && downer != EUID )); then
-            SAFE_WHY="directory $d is owned by uid $downer"; return 1
-        fi
-        if (( 8#$dmode & 8#022 )); then
-            if ! { (( 8#$dmode & 8#1000 )) && (( downer == 0 )); }; then
-                SAFE_WHY="directory $d is writable by group or others (mode $dmode)"; return 1
-            fi
-        fi
-        [[ "$d" == / ]] && return 0
-        d=$(dirname -- "$d")
-    done
-}
-
-# safe_exec_file PATH -> 0 if PATH is an absolute path to an executable regular
-# file that only root (or this user) can change: owned by uid 0 or the running
-# user, no group/world write bit, and every directory above it (after resolving
-# symlinks, and also along the path as given) passes dir_chain_safe.
-# On refusal, SAFE_WHY says why.
-safe_exec_file() {
-    local p="$1" resolved owner mode pdir
-    SAFE_WHY=""
-    if [[ "$p" != /* ]]; then SAFE_WHY="not an absolute path"; return 1; fi
-    if [[ ! -f "$p" || ! -x "$p" ]]; then SAFE_WHY="not an executable regular file"; return 1; fi
-    resolved=$(readlink -f -- "$p") || { SAFE_WHY="cannot resolve the path"; return 1; }
-    read -r owner mode < <(stat -L -c '%u %a' -- "$resolved") || { SAFE_WHY="cannot stat it"; return 1; }
-    if (( owner != 0 && owner != EUID )); then SAFE_WHY="owned by uid $owner"; return 1; fi
-    if (( 8#$mode & 8#022 )); then SAFE_WHY="writable by group or others (mode $mode)"; return 1; fi
-    dir_chain_safe "$(dirname -- "$resolved")" || return 1
-    pdir=$(readlink -f -- "$(dirname -- "$p")") || { SAFE_WHY="cannot resolve the directory"; return 1; }
-    dir_chain_safe "$pdir" || return 1
-    return 0
-}
-
-find_gate() {
-    local cand cands=()
-    if [[ -n "${DCF_GATE:-}" ]]; then
-        cands=("$DCF_GATE")          # asked for by name: no silent fallback to another one
-    else
-        cands=(/usr/local/bin/dcf-gate "$SCRIPT_DIR/gate/dcf-gate")
-    fi
-    for cand in "${cands[@]}"; do
-        [[ -e "$cand" ]] || continue
-        if safe_exec_file "$cand"; then
-            DCF_GATE_BIN="$cand"
-            return 0
-        fi
-        log_error "dcf-gate at $cand refused: $SAFE_WHY"
-        return 1
-    done
-    log_error "dcf-gate not found (set DCF_GATE, or build it: make -C gate)"
-    return 1
-}
+# The one definition of "an address", "a port" and "an interval" is the vendored
+# gate (find_gate, in dcf-common.sh, locates it and refuses one that someone else
+# could replace).
 
 # validate_config: refuse to start on a bad value, before anything touches nft.
 validate_config() {
@@ -185,15 +132,20 @@ validate_config() {
     esac
 
     if ! find_gate; then
+        log_error "$GATE_WHY"
         exit "$EX_UNAVAILABLE"
     fi
 
-    if ! err=$("$DCF_GATE_BIN" port "$DCF_PORT" 2>&1 >/dev/null); then
+    if ! err=$("$GATE_BIN" port "$DCF_PORT" 2>&1 >/dev/null); then
         log_error "DCF_PORT '$DCF_PORT' refused: $(bounded "$err")"
         bad=1
     fi
-    if ! err=$("$DCF_GATE_BIN" interval "$SYNC_INTERVAL" 2>&1 >/dev/null); then
+    if ! err=$("$GATE_BIN" interval "$SYNC_INTERVAL" 2>&1 >/dev/null); then
         log_error "SYNC_INTERVAL '$SYNC_INTERVAL' refused: $(bounded "$err")"
+        bad=1
+    fi
+    if ! err=$("$GATE_BIN" interval "$QUERY_TIMEOUT" 2>&1 >/dev/null); then
+        log_error "DCF_QUERY_TIMEOUT '$QUERY_TIMEOUT' refused: $(bounded "$err")"
         bad=1
     fi
     if [[ -n "${TELEMETRY_SCRIPT:-}" ]] && ! safe_exec_file "$TELEMETRY_SCRIPT"; then
@@ -221,71 +173,69 @@ nft_apply() {
     return 0
 }
 
-# Install table, chain, sets and rules in ONE nft transaction: all or nothing,
-# and re-runnable. A kill at any moment leaves either nothing new or the whole
-# ruleset, never a chain that accepts without its drop rule; a restart repairs
-# whatever was there by rebuilding the chain from scratch. (Sets keep their
-# elements.) DCF_PORT is checked again here: this text is parsed by nft.
-init_firewall() {
-    log_info "Initializing firewall ruleset..."
-
-    local err
-    if ! err=$("$DCF_GATE_BIN" port "$DCF_PORT" 2>&1 >/dev/null); then
-        log_error "refusing to build rules for port '$DCF_PORT': $(bounded "$err")"
-        return 1
-    fi
-
-    local tx
-    tx=$(printf '%s\n' \
-        "add table ip $NFT_TABLE" \
-        "add chain ip $NFT_TABLE input { type filter hook input priority 0; policy accept; }" \
-        "add set ip $NFT_TABLE $NFT_SET { type ipv4_addr; flags interval; timeout 1h; }" \
-        "add set ip $NFT_TABLE $NFT_SET_VIP { type ipv4_addr; flags interval; }" \
-        "flush chain ip $NFT_TABLE input" \
-        "add rule ip $NFT_TABLE input udp dport $DCF_PORT ip saddr @$NFT_SET_VIP accept" \
-        "add rule ip $NFT_TABLE input udp dport $DCF_PORT ip saddr @$NFT_SET accept" \
-        "add rule ip $NFT_TABLE input udp dport $DCF_PORT drop")
-
-    nft_apply "the firewall ruleset" "$tx" || return 1
-    log_info "Installed firewall rules for port $DCF_PORT"
-}
-
 # ============================================================================
 # SYNCHRONISATION
 # ============================================================================
 declare -A LAST_REJECTED=()
 
-# sync_set SET LABEL QUERY
-#
-# QUERY selects one column: hex(CAST(last_ip AS BLOB)), so every database value,
-# whatever bytes it holds (newline, NUL, spaces), is exactly one hex line and is
-# judged as the value it is. The addresses dcf-gate admits become the whole new
-# content of SET in one transaction (flush + add element, atomic).
-#
-# Reconciliation, not accumulation:
-#   * the query SUCCEEDED and yields no admitted address -> the set is flushed
-#     (the last revoked user must lose access too);
-#   * the query or the gate FAILED -> the set is left as it was (fail-static),
-#     and an ERROR says so. Whitelist entries still expire on their own after
-#     the set's 1h timeout; vip_permanent has no timeout and keeps its content
-#     until a sync succeeds.
-sync_set() {
+# Who is authorized. `data_used` and `account_balance` are compared only as
+# numbers, never as text (SQLite sorts every number below every text, so a text
+# balance would cover any bill), and usage below zero is not "under the free
+# tier": such a row is corrupt, and a corrupt row is not a reason to let anyone
+# in. NULL stays what it was, a refusal; a VIP is unconditional.
+# "Seen in the last hour" compares instants: datetime() normalises DCF-ID's RFC
+# 3339 text (2026-10-09T01:22:33.123456789+00:00) to 'YYYY-MM-DD HH:MM:SS';
+# NULL and unparseable last_seen are NULL, so stale.
+# Each query selects ONE column, hex(CAST(last_ip AS BLOB)), so every database
+# value, whatever bytes it holds (newline, NUL, spaces), is exactly one hex line
+# and is judged as the value it is.
+readonly WHITELIST_QUERY="
+    SELECT DISTINCT hex(CAST(last_ip AS BLOB))
+    FROM users
+    WHERE last_ip IS NOT NULL
+      AND last_ip != ''
+      AND datetime(last_seen) >= datetime('now', '-1 hour')
+      AND (
+          is_vip = 1
+          OR (
+              typeof(data_used) IN ('integer', 'real')
+              AND data_used >= 0
+              AND (
+                  data_used <= $FREE_BYTES
+                  OR (
+                      typeof(account_balance) IN ('integer', 'real')
+                      AND ((data_used - $FREE_BYTES) * $PRICE_FACTOR) <= account_balance
+                  )
+              )
+          )
+      );
+"
+readonly VIP_QUERY="SELECT DISTINCT hex(CAST(last_ip AS BLOB)) FROM users WHERE is_vip = 1 AND last_ip IS NOT NULL AND last_ip != '';"
+
+# collect_set SET LABEL QUERY
+# Run QUERY, pass its rows through the gate, and describe the result without
+# touching the kernel: returns 0 with COLLECTED_N (how many addresses) and
+# COLLECTED_ELEMS ("" or an `add element` line for SET); returns 1, with an ERROR
+# logged and nothing changed, if the database or the gate failed.
+collect_set() {
     local set="$1" label="$2" query="$3"
     local rows rc=0 gout
+    COLLECTED_N=0
+    COLLECTED_ELEMS=""
 
     if [[ ! -f "$DB_PATH" ]]; then
         log_error "$label: database not found: $DB_PATH; keeping the previous $set"
         return 1
     fi
 
-    rows=$(sqlite3 -readonly "$DB_PATH" "$query" 2>&1) || rc=$?
+    rows=$(timeout "$QUERY_TIMEOUT" sqlite3 -readonly "$DB_PATH" "$query" 2>&1) || rc=$?
     if (( rc != 0 )); then
         log_error "$label: database query failed (exit $rc): $(bounded "$rows"); keeping the previous $set"
         return 1
     fi
 
     rc=0
-    gout=$(printf '%s' "$rows${rows:+$'\n'}" | "$DCF_GATE_BIN" ipv4 --hex --max "$MAX_BATCH" --report 3 2>&1) || rc=$?
+    gout=$(printf '%s' "$rows${rows:+$'\n'}" | "$GATE_BIN" ipv4 --hex --max "$MAX_BATCH" --report 3 2>&1) || rc=$?
 
     local -a addrs=()
     local line read_n="" admitted_n="" rejected_n=0 capped_n=0
@@ -321,49 +271,44 @@ sync_set() {
         log_error "$label: batch cap of $MAX_BATCH reached: capped $capped_n further address(es); they are NOT in $set"
     fi
 
-    local tx="flush set ip $NFT_TABLE $set"
-    if (( ${#addrs[@]} > 0 )); then
+    COLLECTED_N=${#addrs[@]}
+    if (( COLLECTED_N > 0 )); then
         local ip_list
         ip_list=$(IFS=','; echo "${addrs[*]}")
-        tx+=$'\n'"add element ip $NFT_TABLE $set { $ip_list }"
+        COLLECTED_ELEMS="add element ip $NFT_TABLE $set { $ip_list }"
+    fi
+    return 0
+}
+
+# sync_set SET LABEL QUERY
+# Reconciliation, not accumulation: the addresses the gate admits become the
+# whole new content of SET in one transaction (flush + add element, atomic).
+#   * the query SUCCEEDED and yields no admitted address -> the set is flushed
+#     (the last revoked user must lose access too);
+#   * the query or the gate FAILED -> the set is left as it was (fail-static),
+#     and an ERROR says so. Whitelist entries still expire on their own after
+#     the set's 1h timeout; vip_permanent has no timeout and keeps its content
+#     until a sync succeeds.
+sync_set() {
+    local set="$1" label="$2" query="$3"
+    collect_set "$set" "$label" "$query" || return 1
+
+    local tx="flush set ip $NFT_TABLE $set"
+    if [[ -n "$COLLECTED_ELEMS" ]]; then
+        tx+=$'\n'"$COLLECTED_ELEMS"
     fi
     nft_apply "the $set update" "$tx" || return 1
 
-    if (( ${#addrs[@]} > 0 )); then
-        log_debug "$label updated: ${#addrs[@]} IPs"
+    if (( COLLECTED_N > 0 )); then
+        log_debug "$label updated: $COLLECTED_N IPs"
     else
         log_debug "$label cleared (no authorized IPs)"
     fi
     return 0
 }
 
-sync_whitelist() {
-    # Authorized addresses:
-    # - VIP users (unlimited)
-    # - Trial users within 128MB limit
-    # - Paid users with sufficient balance
-    # "Seen in the last hour" compares instants: datetime() normalises
-    # DCF-ID's RFC 3339 text (2026-10-09T01:22:33.123456789+00:00) to
-    # 'YYYY-MM-DD HH:MM:SS'; NULL and unparseable last_seen are NULL, so stale.
-    local query="
-        SELECT DISTINCT hex(CAST(last_ip AS BLOB))
-        FROM users
-        WHERE last_ip IS NOT NULL
-          AND last_ip != ''
-          AND datetime(last_seen) >= datetime('now', '-1 hour')
-          AND (
-              is_vip = 1
-              OR data_used <= $FREE_BYTES
-              OR ((data_used - $FREE_BYTES) * $PRICE_FACTOR) <= account_balance
-          );
-    "
-    sync_set "$NFT_SET" "Whitelist" "$query"
-}
-
-sync_vip_list() {
-    local query="SELECT DISTINCT hex(CAST(last_ip AS BLOB)) FROM users WHERE is_vip = 1 AND last_ip IS NOT NULL AND last_ip != '';"
-    sync_set "$NFT_SET_VIP" "VIP list" "$query"
-}
+sync_whitelist() { sync_set "$NFT_SET" "Whitelist" "$WHITELIST_QUERY"; }
+sync_vip_list()  { sync_set "$NFT_SET_VIP" "VIP list" "$VIP_QUERY"; }
 
 # One reconciliation of both sets. Returns 1 if either failed (and kept its
 # previous content).
@@ -372,6 +317,67 @@ sync_cycle() {
     sync_vip_list || rc=1
     sync_whitelist || rc=1
     return "$rc"
+}
+
+# ============================================================================
+# FIREWALL INSTALL
+# ============================================================================
+# The table dcf_firewall belongs to this daemon. Every start REBUILDS it, in ONE
+# nft transaction:
+#
+#     add table ip dcf_firewall          \ makes the next line safe when the
+#     delete table ip dcf_firewall       / table did not exist yet
+#     add table ip dcf_firewall          and then the whole definition, with the
+#     add chain ... add set ... add rule ...   initial elements of both sets
+#
+# Whatever was there before (a set with other flags, a chain on another hook,
+# extra rules, extra chains) goes with the old table, so no such leftover can make
+# the install fail or leave the port open. The batch is atomic: a packet is judged
+# by the old ruleset or by the new one, never by none, and a kill at any moment
+# leaves one or the other whole.
+#
+# The rebuilt sets are not empty: their contents are read from the database just
+# before and go in the same batch, so a restart does not make anyone wait for the
+# first sync. If the database cannot be read at that moment the sets come up EMPTY
+# (closed: nobody is let in) and the loop's first cycle retries; the drop rule does
+# not wait for the database beyond QUERY_TIMEOUT seconds per query.
+#
+# If the install is still refused (nft missing, no CAP_NET_ADMIN, a kernel without
+# nf_tables) the batch changed nothing, the daemon exits 1 with nft's own error,
+# and the host's own firewall policy stays in force: the port is exactly as open
+# as it was before.
+init_firewall() {
+    log_info "Initializing firewall ruleset..."
+
+    local err
+    if ! err=$("$GATE_BIN" port "$DCF_PORT" 2>&1 >/dev/null); then
+        log_error "refusing to build rules for port '$DCF_PORT': $(bounded "$err")"
+        return 1
+    fi
+
+    local vip_elems="" wl_elems="" empty_start=0
+    if collect_set "$NFT_SET_VIP" "VIP list" "$VIP_QUERY"; then vip_elems=$COLLECTED_ELEMS; else empty_start=1; fi
+    if collect_set "$NFT_SET" "Whitelist" "$WHITELIST_QUERY"; then wl_elems=$COLLECTED_ELEMS; else empty_start=1; fi
+    if (( empty_start )); then
+        log_warn "starting with empty address sets (the database could not be read): nobody is let in until a sync succeeds"
+    fi
+
+    local tx
+    tx=$(printf '%s\n' \
+        "add table ip $NFT_TABLE" \
+        "delete table ip $NFT_TABLE" \
+        "add table ip $NFT_TABLE" \
+        "add chain ip $NFT_TABLE input { type filter hook input priority 0; policy accept; }" \
+        "add set ip $NFT_TABLE $NFT_SET { type ipv4_addr; flags interval; timeout 1h; }" \
+        "add set ip $NFT_TABLE $NFT_SET_VIP { type ipv4_addr; flags interval; }" \
+        "add rule ip $NFT_TABLE input udp dport $DCF_PORT ip saddr @$NFT_SET_VIP accept" \
+        "add rule ip $NFT_TABLE input udp dport $DCF_PORT ip saddr @$NFT_SET accept" \
+        "add rule ip $NFT_TABLE input udp dport $DCF_PORT drop")
+    [[ -z "$vip_elems" ]] || tx+=$'\n'"$vip_elems"
+    [[ -z "$wl_elems" ]] || tx+=$'\n'"$wl_elems"
+
+    nft_apply "the firewall ruleset" "$tx" || return 1
+    log_info "Installed firewall rules for port $DCF_PORT"
 }
 
 # Run the telemetry script if configured, and only if it is still a file that
@@ -403,6 +409,12 @@ shutdown_handler() {
 main() {
     trap shutdown_handler SIGTERM SIGINT SIGHUP
 
+    # first: PATH is pinned and the inherited environment dropped, before any
+    # external program runs
+    if ! harden_env; then
+        log_error "$SAFE_WHY"
+        exit "$EX_UNAVAILABLE"
+    fi
     validate_config
 
     log_info "DeMoD Watchdog v$VERSION starting..."
@@ -412,7 +424,7 @@ main() {
 
     # Initialize firewall
     if ! init_firewall; then
-        log_error "Could not install the firewall ruleset; not starting"
+        log_error "Could not install the firewall ruleset; not starting. The host's own firewall policy stays in force: UDP port $DCF_PORT is NOT protected by this daemon"
         exit 1
     fi
 

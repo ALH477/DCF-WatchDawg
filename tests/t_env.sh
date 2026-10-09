@@ -26,13 +26,13 @@ if [[ -e "$marker" ]]; then bad "hostile PATH: none of the shadowing tools runs"
 else ok "hostile PATH: none of the shadowing tools runs"; fi
 
 rm -f "$marker"
-env PATH="$evil:$PATH" bash "$TELEMETRY" >/dev/null 2>&1; rc=$?
+env PATH="$evil:$PATH" "$BASH" "$TELEMETRY" >/dev/null 2>&1; rc=$?
 assert_eq "hostile PATH: telemetry run alone still publishes (exit 0)" 0 "$rc"
 if [[ -e "$marker" ]]; then bad "hostile PATH: telemetry runs none of the shadowing tools" "ran: $(sort -u "$marker" | tr '\n' ' ')"
 else ok "hostile PATH: telemetry runs none of the shadowing tools"; fi
 
 rm -f "$marker"
-env PATH="$evil:$PATH" bash "$T_ROOT/dcf-healthcheck.sh" >/dev/null 2>&1
+env PATH="$evil:$PATH" "$BASH" "$T_ROOT/dcf-healthcheck.sh" >/dev/null 2>&1
 if [[ -e "$marker" ]]; then bad "hostile PATH: the health check runs none of the shadowing tools" "ran: $(sort -u "$marker" | tr '\n' ' ')"
 else ok "hostile PATH: the health check runs none of the shadowing tools"; fi
 
@@ -46,7 +46,7 @@ out=$(DCF_PATH="relative/bin:$T_TOOLPATH" wd_once); rc=$?
 assert_eq "DCF_PATH with a relative entry is refused (exit 69)" 69 "$rc"
 out=$(DCF_PATH="$TMP/nonexistent:$T_TOOLPATH" wd_once); rc=$?
 assert_eq "DCF_PATH with a missing directory is refused (exit 69)" 69 "$rc"
-out=$(DCF_PATH="$TMP/open:$T_TOOLPATH" bash "$TELEMETRY" 2>&1); rc=$?
+out=$(DCF_PATH="$TMP/open:$T_TOOLPATH" "$BASH" "$TELEMETRY" 2>&1); rc=$?
 assert_eq "telemetry refuses it too (exit 69)" 69 "$rc"
 
 # ---- BASH_ENV, ENV and LD_PRELOAD are not handed on
@@ -58,7 +58,7 @@ lines=$(wc -l < "$marker" 2>/dev/null || echo 0)
 # can only keep it from the shells it starts (the telemetry script and its children)
 assert_eq "BASH_ENV: read once (by the daemon's own shell), not again by the shells it starts" 1 "$lines"
 rm -f "$marker"
-out=$(BASH_ENV=$benv ENV=$benv TELEMETRY_SCRIPT="$tel" DCF_WATCHDOG_ONCE=1 bash -p "$WATCHDOG" 2>&1)
+out=$(BASH_ENV=$benv ENV=$benv TELEMETRY_SCRIPT="$tel" DCF_WATCHDOG_ONCE=1 "$BASH" -p "$WATCHDOG" 2>&1)
 if [[ -e "$marker" ]]; then bad "BASH_ENV: not read at all when the daemon is started with bash -p (the image's ENTRYPOINT)" "$(cat "$marker")"
 else ok "BASH_ENV: not read at all when the daemon is started with bash -p (the image's ENTRYPOINT)"; fi
 

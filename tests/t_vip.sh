@@ -51,25 +51,58 @@ wd_once >/dev/null
 assert_eq "bob out of quota: whitelist emptied" "" "$(set_elems whitelist)"
 
 # -- 4. a FAILED query keeps the previous state and logs an error ---------------
+# This is about a RUNNING daemon: between two of its cycles the database goes bad.
+# (A restart rebuilds the table, and with an unreadable database the sets come up
+# empty: tests/t_firewall.sh.) So here the daemon really loops, one cycle a second.
+daemon_start() {   # daemon_start -> background daemon, log in $TMP/daemon.log, pid in DPID
+    : > "$TMP/daemon.log"
+    SYNC_INTERVAL=1 LOG_LEVEL=debug "$BASH" "$WATCHDOG" > "$TMP/daemon.log" 2>&1 &
+    DPID=$!
+}
+daemon_wait() {    # daemon_wait PATTERN COUNT -> waits (at most 10 s) for COUNT log lines matching PATTERN
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ $(grep -c -- "$1" "$TMP/daemon.log") -ge $2 ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+daemon_stop() { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
+
 nft_reset
 mkdb "$db" '["vip","8.8.8.8","now",0,0,1]' '["bob","8.8.4.4","now",0,0,0]'
-wd_once >/dev/null
+daemon_start
+daemon_wait 'Whitelist updated: 2 IPs' 2 || bad "the daemon ran two cycles" "$(cat "$TMP/daemon.log")"
+assert_eq "(daemon running) vip_permanent holds the VIP" "8.8.8.8" "$(set_elems vip_permanent)"
 printf 'this is not a database' > "$db"
-out=$(wd_once); rc=$?
+daemon_wait 'database query failed' 2 || bad "the daemon noticed the broken database" "$(cat "$TMP/daemon.log")"
 assert_eq "DB unreadable: vip_permanent kept (fail-static)" "8.8.8.8" "$(set_elems vip_permanent)"
 assert_eq "DB unreadable: whitelist kept (fail-static)" $'8.8.4.4\n8.8.8.8' "$(set_elems whitelist)"
-if grep -q '"level":"error"' <<<"$out"; then ok "DB unreadable: an error is logged"
-else bad "DB unreadable: an error is logged" "$out"; fi
-if [[ $rc -ne 0 ]]; then ok "DB unreadable: the one-shot run exits non-zero"
-else bad "DB unreadable: the one-shot run exits non-zero" "rc=$rc"; fi
+if grep '"level":"error"' "$TMP/daemon.log" | grep -q 'database query failed'; then ok "DB unreadable: an error is logged"
+else bad "DB unreadable: an error is logged" "$(cat "$TMP/daemon.log")"; fi
+assert_eq "DB unreadable: the drop rule is still there" "udp dport 7777 drop" "$(chain_rules | tail -1)"
+# and it recovers by itself
+mkdb "$db" '["vip","8.8.8.8","now",0,0,1]'
+daemon_wait 'VIP list updated' 3 || true
+assert_eq "DB readable again: the sets are reconciled with it (bob is gone)" "8.8.8.8" "$(set_elems whitelist)"
+daemon_stop
 
-rm -f "$db"
 nft_reset
 mkdb "$db" '["vip","8.8.8.8","now",0,0,1]'
-wd_once >/dev/null
+daemon_start
+daemon_wait 'VIP list updated' 2 || true
 sqlite3 "$db" 'DROP TABLE users'       # a query error, not an empty result
-out=$(wd_once)
+daemon_wait 'database query failed' 1 || bad "the daemon noticed the missing table" "$(cat "$TMP/daemon.log")"
 assert_eq "no users table (query error): vip_permanent kept, not flushed" "8.8.8.8" "$(set_elems vip_permanent)"
+daemon_stop
+
+# the one-shot run (a restart) on an unreadable database exits non-zero and says so
+nft_reset
+mkdb "$db" '["vip","8.8.8.8","now",0,0,1]'
+printf 'this is not a database' > "$db"
+out=$(wd_once); rc=$?
+if [[ $rc -ne 0 ]]; then ok "DB unreadable at start: the run exits non-zero"; else bad "DB unreadable at start: the run exits non-zero" "rc=$rc"; fi
+if grep -q '"level":"error"' <<<"$out"; then ok "DB unreadable at start: an error is logged"; else bad "DB unreadable at start: an error is logged" "$out"; fi
 
 # -- 5. nft failures are logged with nft's own text -----------------------------
 nft_reset

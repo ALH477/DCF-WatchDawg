@@ -104,7 +104,7 @@ mkdb() { python3 "$T_DIR/mkdb.py" "$@"; }
 # wd_once: one init+sync cycle of the watchdog, as a child process. Environment
 # assignments in front of the call reach it. Output (stdout+stderr) is returned.
 wd_once() {
-    DCF_WATCHDOG_ONCE=1 bash "$WATCHDOG" 2>&1
+    DCF_WATCHDOG_ONCE=1 "$BASH" "$WATCHDOG" 2>&1
 }
 
 nft_reset() {   # real: empty the (netns-private) kernel ruleset. shim: forget the recorded calls.

@@ -42,10 +42,15 @@ readonly WEB_ROOT="${WEB_ROOT:-/var/lib/demod/public}"
 readonly OUTPUT_FILE="$WEB_ROOT/status.json"
 readonly TELEMETRY_PEERS="${TELEMETRY_PEERS:-names}"
 TEMP_FILE=""
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This script's directory, by builtins only: no external program runs before
+# harden_env has pinned PATH.
+_src="${BASH_SOURCE[0]}"
+[[ "$_src" == */* ]] && _src="${_src%/*}" || _src=.
+SCRIPT_DIR="$(cd "$_src" && pwd)"
 readonly SCRIPT_DIR
-GATE_BIN=""
-SAFE_WHY=""
+unset _src
+# shellcheck source=dcf-common.sh
+. "$SCRIPT_DIR/dcf-common.sh"
 
 # ============================================================================
 # CLEANUP
@@ -65,60 +70,6 @@ die() {
 # ============================================================================
 # SAFETY CHECKS
 # ============================================================================
-# (dir_chain_safe, safe_exec_file and find_gate are the same as in
-# dcf-watchdog.sh: the two scripts are deployed independently, so each carries
-# them. A gate that someone else could replace is refused, because it runs as
-# root.)
-dir_chain_safe() {
-    local d="$1" downer dmode
-    while :; do
-        read -r downer dmode < <(stat -L -c '%u %a' -- "$d") || { SAFE_WHY="cannot stat $d"; return 1; }
-        if (( downer != 0 && downer != EUID )); then
-            SAFE_WHY="directory $d is owned by uid $downer"; return 1
-        fi
-        if (( 8#$dmode & 8#022 )); then
-            if ! { (( 8#$dmode & 8#1000 )) && (( downer == 0 )); }; then
-                SAFE_WHY="directory $d is writable by group or others (mode $dmode)"; return 1
-            fi
-        fi
-        [[ "$d" == / ]] && return 0
-        d=$(dirname -- "$d")
-    done
-}
-
-safe_exec_file() {
-    local p="$1" resolved owner mode pdir
-    SAFE_WHY=""
-    if [[ "$p" != /* ]]; then SAFE_WHY="not an absolute path"; return 1; fi
-    if [[ ! -f "$p" || ! -x "$p" ]]; then SAFE_WHY="not an executable regular file"; return 1; fi
-    resolved=$(readlink -f -- "$p") || { SAFE_WHY="cannot resolve the path"; return 1; }
-    read -r owner mode < <(stat -L -c '%u %a' -- "$resolved") || { SAFE_WHY="cannot stat it"; return 1; }
-    if (( owner != 0 && owner != EUID )); then SAFE_WHY="owned by uid $owner"; return 1; fi
-    if (( 8#$mode & 8#022 )); then SAFE_WHY="writable by group or others (mode $mode)"; return 1; fi
-    dir_chain_safe "$(dirname -- "$resolved")" || return 1
-    pdir=$(readlink -f -- "$(dirname -- "$p")") || { SAFE_WHY="cannot resolve the directory"; return 1; }
-    dir_chain_safe "$pdir" || return 1
-    return 0
-}
-
-find_gate() {
-    local cand cands=()
-    if [[ -n "${DCF_GATE:-}" ]]; then
-        cands=("$DCF_GATE")          # asked for by name: no silent fallback to another one
-    else
-        cands=(/usr/local/bin/dcf-gate "$SCRIPT_DIR/gate/dcf-gate")
-    fi
-    for cand in "${cands[@]}"; do
-        [[ -e "$cand" ]] || continue
-        if safe_exec_file "$cand"; then
-            GATE_BIN="$cand"
-            return 0
-        fi
-        DIE_STATUS=69 die "dcf-gate at $cand refused: $SAFE_WHY"
-    done
-    DIE_STATUS=69 die "dcf-gate not found (set DCF_GATE, or build it: make -C gate)"
-}
-
 check_config() {
     case "$TELEMETRY_PEERS" in
         names|count|off) ;;
@@ -189,8 +140,11 @@ number() {
 # METRICS COLLECTION
 # ============================================================================
 collect_metrics() {
+    # first: PATH is pinned and the inherited environment dropped, before any
+    # external program runs
+    harden_env || DIE_STATUS=69 die "$SAFE_WHY"
     check_config
-    find_gate
+    find_gate || DIE_STATUS=69 die "$GATE_WHY"
     check_web_root
 
     # System metrics
@@ -294,7 +248,8 @@ collect_metrics() {
   \"peers\": $users$counts
 }" > "$TEMP_FILE"
 
-    # Validate JSON before deployment
+    # Validate JSON before deployment. A validator is required: text nobody has
+    # checked is not published (the image installs jq).
     local valid=false
 
     if command -v jq &>/dev/null; then
@@ -302,12 +257,12 @@ collect_metrics() {
             valid=true
         fi
     elif command -v python3 &>/dev/null; then
-        if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$TEMP_FILE" 2>/dev/null; then
+        if python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$TEMP_FILE" 2>/dev/null; then
             valid=true
         fi
     else
-        # No validator available, assume valid
-        valid=true
+        echo "dcf-telemetry: no JSON validator (jq or python3) is installed; not publishing" >&2
+        return 1
     fi
 
     if [[ "$valid" == "true" ]]; then

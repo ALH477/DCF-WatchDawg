@@ -169,7 +169,7 @@ if needs_real_nft "pre-existing table"; then
     assert_eq "a refused install exits 1" 1 "$rc"
     if grep '"level":"error"' <<<"$out" | grep -q 'synthetic-install-failure'; then ok "a refused install logs nft's own error"
     else bad "a refused install logs nft's own error" "$out"; fi
-    assert_has "... and says what that means for the port" "$out" "not protected by this daemon"
+    assert_has "... and says what that means for the port" "$out" "NOT protected by this daemon"
     assert_eq "a refused install changes nothing" "$old_shape" "$(table_shape)"
 
     # a restart takes nothing from a whitelisted source: stream numbered datagrams while the
@@ -185,6 +185,18 @@ if needs_real_nft "pre-existing table"; then
     assert_eq "ten restarts while datagrams flow: whitelisted source loses nothing, the other nothing arrives" \
         "RECV $(awk '/^10.9.0.2/{split($2,a,"=");split($3,b,"=");print (a[2]==b[2]) ? "all" : "LOST " (a[2]-b[2])}' "$TMP/stream.txt") $(awk '/^10.9.0.3/{split($3,b,"=");print b[2]}' "$TMP/stream.txt")" \
         "RECV all 0"
+
+    # a hung database holds the drop rule back for at most DCF_QUERY_TIMEOUT per query
+    nft_reset
+    mkdir -m 755 "$TMP/hang"; printf '#!/bin/sh\nexec sleep 30\n' > "$TMP/hang/sqlite3"; chmod 755 "$TMP/hang/sqlite3"
+    start=$SECONDS
+    out=$(DCF_PATH="$TMP/hang:$T_TOOLPATH" DCF_QUERY_TIMEOUT=1 wd_once); rc=$?
+    took=$((SECONDS - start))
+    assert_eq "a database that hangs: the rules are installed anyway" "$want" "$(chain_rules)"
+    if [[ $took -le 8 ]]; then ok "... within DCF_QUERY_TIMEOUT per query (${took}s for 4 queries of 1 s)"; else bad "... within DCF_QUERY_TIMEOUT per query" "took ${took}s"; fi
+    assert_has "... the timeouts are logged as failed queries" "$out" "database query failed (exit 124)"
+    assert_eq "... and the run exits 1" 1 "$rc"
+    assert_eq "... with nobody let in" "NORX" "$(probe 10.9.0.2)"
 
     # restart with an unreadable database: the rebuilt table comes up empty (closed), not open
     nft_reset
@@ -211,12 +223,12 @@ if [[ "$DCF_TEST_NFT_MODE" == shim ]]; then
 import re, sys
 log = open(sys.argv[1]).read()
 blocks = re.findall(r"STDIN-BEGIN\n(.*?)\nSTDIN-END", log, re.S)
-need = ["add chain ip dcf_firewall input", "flush chain ip dcf_firewall input",
+need = ["delete table ip dcf_firewall", "add chain ip dcf_firewall input",
         "udp dport 7777 ip saddr @vip_permanent accept", "udp dport 7777 ip saddr @whitelist accept", "udp dport 7777 drop"]
 sys.exit(0 if any(all(n in b for n in need) for b in blocks) else 1)
 PY
-    then ok "(shim) one transaction carries the chain, a flush, both accepts and the drop"
-    else bad "(shim) one transaction carries the chain, a flush, both accepts and the drop" "$(cat "$NFT_SHIM_LOG")"; fi
+    then ok "(shim) one transaction carries the table's deletion, the chain, both accepts and the drop"
+    else bad "(shim) one transaction carries the table's deletion, the chain, both accepts and the drop" "$(cat "$NFT_SHIM_LOG")"; fi
     skip "(shim) kernel state after a kill" "needs real nft"
 fi
 

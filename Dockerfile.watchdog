@@ -41,8 +41,11 @@ RUN mkdir -p /data /scripts
 COPY dcf-watchdog.sh /scripts/dcf-watchdog.sh
 COPY dcf-telemetry.sh /scripts/dcf-telemetry.sh
 COPY dcf-healthcheck.sh /scripts/dcf-healthcheck.sh
+COPY dcf-common.sh /scripts/dcf-common.sh
 
-RUN chmod 755 /scripts/*.sh
+# The three scripts run; dcf-common.sh is sourced by them and is not executable.
+RUN chmod 755 /scripts/dcf-watchdog.sh /scripts/dcf-telemetry.sh /scripts/dcf-healthcheck.sh \
+ && chmod 644 /scripts/dcf-common.sh
 
 # Environment
 ENV DB_PATH=/data/identity.db
@@ -55,4 +58,7 @@ ENV LOG_LEVEL=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/scripts/dcf-healthcheck.sh"]
 
-ENTRYPOINT ["/scripts/dcf-watchdog.sh"]
+# bash -p: do not read $BASH_ENV / $ENV, do not import shell functions from the
+# environment. (The script drops them for everything it starts; only this keeps
+# bash itself from reading them first.)
+ENTRYPOINT ["/bin/bash", "-p", "/scripts/dcf-watchdog.sh"]
