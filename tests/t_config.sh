@@ -70,6 +70,15 @@ for good in debug info warn error; do
     run "LOG_LEVEL=$good"; assert_eq "W4 LOG_LEVEL=$good starts" 0 "$RC"
 done
 
+# the gate: an explicit DCF_GATE that is missing or unsafe is refused (69), never replaced by another
+nft_reset
+run DCF_GATE=/nonexistent/dcf-gate; assert_eq "gate: a missing DCF_GATE is refused with exit 69" 69 "$RC"
+mkdir -m 777 "$TMP/gate_bad"; cp "$T_ROOT/gate/dcf-gate" "$TMP/gate_bad/dcf-gate"
+run DCF_GATE="$TMP/gate_bad/dcf-gate"; assert_eq "gate: a gate in a world-writable directory is refused with exit 69" 69 "$RC"
+chmod 755 "$TMP/gate_bad"; chmod 777 "$TMP/gate_bad/dcf-gate"
+run DCF_GATE="$TMP/gate_bad/dcf-gate"; assert_eq "gate: a world-writable gate is refused with exit 69" 69 "$RC"
+if nft_untouched; then ok "gate: ... and nothing was installed"; else bad "gate: ... and nothing was installed"; fi
+
 # an empty variable still means "use the default" (${VAR:-default}), as it always did
 nft_reset
 run DCF_PORT= SYNC_INTERVAL= LOG_LEVEL=

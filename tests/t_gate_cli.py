@@ -151,7 +151,7 @@ def sanitised_build():
     out = os.path.join(tmp, "dcf-gate-asan")
     cmd = ["gcc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
            "-I", GATE_DIR, os.path.join(GATE_DIR, "dcf-gate.c"), os.path.join(GATE_DIR, "dcf_net_gate.gen.c"),
-           "-o", out]
+           os.path.join(GATE_DIR, "watchdawg_gate.gen.c"), "-o", out]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return out if r.returncode == 0 else None
 
@@ -315,6 +315,45 @@ check("port: extra arguments are a usage error", rc == 2, (rc, err))
 rc, out, err = run(["port", "7777\0".replace("\0", "")])
 check("port 7777 echoes the value", rc == 0 and out == b"7777\n", (rc, out))
 
+# ------------------------------------------------------------------ number / load (watchdawg_gate)
+def num_oracle(t):
+    return re.fullmatch(rb"(0|[1-9][0-9]{0,19})", t) is not None
+
+
+def load_oracle(t):
+    return re.fullmatch(rb"(0|[1-9][0-9]{0,5})(\.[0-9]{1,6})?", t) is not None
+
+
+def argv_ok(t):
+    return b"\x00" not in t          # an argv word cannot hold a NUL
+
+
+num_cands = [b"", b"0", b"00", b"007", b"1", b"10", b"18446744073709551615", b"99999999999999999999", b"100000000000000000000",
+             b"1" * 19, b"1" * 20, b"1" * 21, b"1" * 64, b"0" + b"1" * 19, b"-1", b"+1", b"1e5", b"0x1f", b"1.5", b"1,", b" 1", b"1 ",
+             b"1\n", b"1\r", b"nan", b"inf", b'1,"x":2', "٣".encode(), "１".encode(), b"1\xff"]
+load_cands = [b"", b"0", b"0.42", b"12.5", b"104.50", b"3", b"100", b"0.0", b"0.", b".5", b".", b"00.5", b"01", b"1.2.3", b"1..2",
+              b"1234567", b"1234567.1", b"123456.1234567", b"123456.123456", b"999999.999999", b"0.0000001", b"0.000001", b"1e2",
+              b"-0.1", b"+0.1", b"nan", b"inf", b" 0.4", b"0.4 ", b"0.4\n", b'0.42,"injected":true', b"0.42,", b"1" * 13, b"1" * 14,
+              "٣.٤".encode(), b"1.5\xff"]
+for t in itertools.chain.from_iterable(itertools.product(b"0159.", repeat=k) for k in range(0, 5)):
+    num_cands.append(bytes(t))
+    load_cands.append(bytes(t))
+for fn, cands, oracle in (("number", num_cands, num_oracle), ("load", load_cands, load_oracle)):
+    bad_cases = []
+    n_run = 0
+    for t in cands:
+        if not argv_ok(t):
+            continue
+        n_run += 1
+        rc, out, err = run([fn, os.fsdecode(t)])      # (surrogateescape: non-UTF-8 bytes round-trip)
+        want = oracle(t)
+        if (rc == 0) != want or (rc == 0 and out != t + b"\n"):
+            bad_cases.append((t, rc, out))
+    check("%s: %d candidates agree with the oracle (JSON number grammar, digit-count limits)" % (fn, n_run),
+          not bad_cases, bad_cases[:5])
+rc, out, err = run(["number", "1", "2"])
+check("number: extra arguments are a usage error", rc == 2, (rc, err))
+
 # ------------------------------------------------------------------ usage, selftest, trap
 rc, out, err = run([])
 check("no arguments: usage, exit 2", rc == 2 and b"usage" in err, (rc, err))
@@ -333,7 +372,9 @@ with open(stub, "w") as f:
             'uint64_t exs_admitte_ipv4(unsigned char *p, uint64_t n){(void)p;(void)n;exsrt_abortus(1);}\n'
             'uint64_t exs_ordo_ipv4(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n'
             'uint64_t exs_admitte_portum(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n'
-            'uint64_t exs_admitte_intervallum(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n')
+            'uint64_t exs_admitte_intervallum(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n'
+            'uint64_t exs_admitte_numerum(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n'
+            'uint64_t exs_admitte_onus(unsigned char *p, uint64_t n){(void)p;(void)n;return 0;}\n')
 trap_bin = os.path.join(tmp, "dcf-gate-trap")
 r = subprocess.run(["gcc", "-std=c11", "-O2", "-I", GATE_DIR, os.path.join(GATE_DIR, "dcf-gate.c"), stub, "-o", trap_bin],
                    capture_output=True, text=True)

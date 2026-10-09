@@ -156,9 +156,14 @@ safe_exec_file() {
 }
 
 find_gate() {
-    local cand
-    for cand in "${DCF_GATE:-}" /usr/local/bin/dcf-gate "$SCRIPT_DIR/gate/dcf-gate"; do
-        [[ -n "$cand" && -e "$cand" ]] || continue
+    local cand cands=()
+    if [[ -n "${DCF_GATE:-}" ]]; then
+        cands=("$DCF_GATE")          # asked for by name: no silent fallback to another one
+    else
+        cands=(/usr/local/bin/dcf-gate "$SCRIPT_DIR/gate/dcf-gate")
+    fi
+    for cand in "${cands[@]}"; do
+        [[ -e "$cand" ]] || continue
         if safe_exec_file "$cand"; then
             DCF_GATE_BIN="$cand"
             return 0

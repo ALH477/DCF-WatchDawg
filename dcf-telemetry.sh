@@ -14,14 +14,15 @@
 # Generates status.json for dashboard consumption.
 # Collects system metrics, network stats, and sanitized user data.
 #
-# Dependencies: sqlite3, gawk, coreutils, iproute2, jq (optional)
+# Dependencies: sqlite3, gawk, coreutils, iproute2, jq (optional), dcf-gate
+#               (gate/dcf-gate; shared with dcf-watchdog.sh, see gate/PROVENANCE.md)
 #
 # This runs as root and writes into a directory that a web server reads, so:
 # the output directory must be owned by the running user and not writable by
 # anyone else (checked, not assumed), the temporary file is created with
 # mktemp (O_EXCL, mode 0600, unpredictable name) and moved into place, every
-# number is validated before it is written into the JSON, and the database is
-# opened read-only.
+# number is validated by dcf-gate before it is written into the JSON, and the
+# database is opened read-only.
 #
 # TELEMETRY_PEERS controls what is published about users:
 #   names  (default) each user's name, tier, VIP flag and online status
@@ -41,6 +42,10 @@ readonly WEB_ROOT="${WEB_ROOT:-/var/lib/demod/public}"
 readonly OUTPUT_FILE="$WEB_ROOT/status.json"
 readonly TELEMETRY_PEERS="${TELEMETRY_PEERS:-names}"
 TEMP_FILE=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+GATE_BIN=""
+SAFE_WHY=""
 
 # ============================================================================
 # CLEANUP
@@ -60,6 +65,60 @@ die() {
 # ============================================================================
 # SAFETY CHECKS
 # ============================================================================
+# (dir_chain_safe, safe_exec_file and find_gate are the same as in
+# dcf-watchdog.sh: the two scripts are deployed independently, so each carries
+# them. A gate that someone else could replace is refused, because it runs as
+# root.)
+dir_chain_safe() {
+    local d="$1" downer dmode
+    while :; do
+        read -r downer dmode < <(stat -L -c '%u %a' -- "$d") || { SAFE_WHY="cannot stat $d"; return 1; }
+        if (( downer != 0 && downer != EUID )); then
+            SAFE_WHY="directory $d is owned by uid $downer"; return 1
+        fi
+        if (( 8#$dmode & 8#022 )); then
+            if ! { (( 8#$dmode & 8#1000 )) && (( downer == 0 )); }; then
+                SAFE_WHY="directory $d is writable by group or others (mode $dmode)"; return 1
+            fi
+        fi
+        [[ "$d" == / ]] && return 0
+        d=$(dirname -- "$d")
+    done
+}
+
+safe_exec_file() {
+    local p="$1" resolved owner mode pdir
+    SAFE_WHY=""
+    if [[ "$p" != /* ]]; then SAFE_WHY="not an absolute path"; return 1; fi
+    if [[ ! -f "$p" || ! -x "$p" ]]; then SAFE_WHY="not an executable regular file"; return 1; fi
+    resolved=$(readlink -f -- "$p") || { SAFE_WHY="cannot resolve the path"; return 1; }
+    read -r owner mode < <(stat -L -c '%u %a' -- "$resolved") || { SAFE_WHY="cannot stat it"; return 1; }
+    if (( owner != 0 && owner != EUID )); then SAFE_WHY="owned by uid $owner"; return 1; fi
+    if (( 8#$mode & 8#022 )); then SAFE_WHY="writable by group or others (mode $mode)"; return 1; fi
+    dir_chain_safe "$(dirname -- "$resolved")" || return 1
+    pdir=$(readlink -f -- "$(dirname -- "$p")") || { SAFE_WHY="cannot resolve the directory"; return 1; }
+    dir_chain_safe "$pdir" || return 1
+    return 0
+}
+
+find_gate() {
+    local cand cands=()
+    if [[ -n "${DCF_GATE:-}" ]]; then
+        cands=("$DCF_GATE")          # asked for by name: no silent fallback to another one
+    else
+        cands=(/usr/local/bin/dcf-gate "$SCRIPT_DIR/gate/dcf-gate")
+    fi
+    for cand in "${cands[@]}"; do
+        [[ -e "$cand" ]] || continue
+        if safe_exec_file "$cand"; then
+            GATE_BIN="$cand"
+            return 0
+        fi
+        DIE_STATUS=69 die "dcf-gate at $cand refused: $SAFE_WHY"
+    done
+    DIE_STATUS=69 die "dcf-gate not found (set DCF_GATE, or build it: make -C gate)"
+}
+
 check_config() {
     case "$TELEMETRY_PEERS" in
         names|count|off) ;;
@@ -70,18 +129,22 @@ check_config() {
 # WEB_ROOT must be a real directory that only this user can write to. Anyone
 # who can create entries in it could pre-place a symlink or swap the file
 # between our write and our rename.
+WEB_ID=""
 check_web_root() {
-    if [[ -L "$WEB_ROOT" ]]; then
+    # (a trailing slash would make the -L test follow the link: strip it)
+    local w="$WEB_ROOT"
+    while [[ "$w" == */ && "$w" != / ]]; do w=${w%/}; done
+    if [[ -L "$w" ]]; then
         die "WEB_ROOT '$WEB_ROOT' is a symbolic link; refusing"
     fi
-    if [[ ! -e "$WEB_ROOT" ]]; then
-        ( umask 022; mkdir -p -- "$WEB_ROOT" )
+    if [[ ! -e "$w" ]]; then
+        ( umask 022; mkdir -p -- "$w" )
     fi
-    if [[ -L "$WEB_ROOT" || ! -d "$WEB_ROOT" ]]; then
+    if [[ -L "$w" || ! -d "$w" ]]; then
         die "WEB_ROOT '$WEB_ROOT' is not a directory; refusing"
     fi
     local owner mode
-    read -r owner mode < <(stat -c '%u %a' -- "$WEB_ROOT") || die "cannot stat WEB_ROOT '$WEB_ROOT'"
+    read -r owner mode < <(stat -c '%u %a' -- "$w") || die "cannot stat WEB_ROOT '$WEB_ROOT'"
     if (( owner != EUID )); then
         die "WEB_ROOT '$WEB_ROOT' is owned by uid $owner, not by the running uid $EUID; refusing"
     fi
@@ -91,21 +154,30 @@ check_web_root() {
     if [[ -d "$OUTPUT_FILE" ]]; then
         die "'$OUTPUT_FILE' is a directory; refusing"
     fi
+    WEB_ID=$(stat -c '%d:%i' -- "$w")
+}
+
+# Just before the rename: still the directory that was checked, not a link put
+# in its place since. (The directories ABOVE WEB_ROOT are not checked; a volume
+# root has to be writable by whoever writes the database. README, known limits.)
+recheck_web_root() {
+    local w="$WEB_ROOT"
+    while [[ "$w" == */ && "$w" != / ]]; do w=${w%/}; done
+    if [[ -L "$w" ]] || [[ "$(stat -c '%d:%i' -- "$w" 2>/dev/null)" != "$WEB_ID" ]]; then
+        die "WEB_ROOT '$WEB_ROOT' changed while status.json was being written; refusing"
+    fi
 }
 
 # A number from the system, destined for the JSON text unquoted. NUM gets the
-# value if it is a valid JSON number of the stated kind, else 0 (and a note on
-# stderr). Nothing else is ever interpolated into a number position.
-#   int  0 | [1-9][0-9]{0,19}
-#   dec  as int, optionally .digits (a load average)
+# value if dcf-gate admits it as a number of the stated kind, else 0 (and a
+# note on stderr). Nothing else is ever interpolated into a number position.
+#   int  `dcf-gate number`: a JSON integer, 1..20 digits, no leading zero
+#   dec  `dcf-gate load`:   as int (6 digits), optionally . and 1..6 digits
 NUM=0
 number() {
-    local name="$1" v="$2" kind="$3" re
-    case "$kind" in
-        int) re='^(0|[1-9][0-9]{0,19})$' ;;
-        dec) re='^(0|[1-9][0-9]{0,5})(\.[0-9]{1,6})?$' ;;
-    esac
-    if [[ "$v" =~ $re ]]; then
+    local name="$1" v="$2" kind="$3" sub=number
+    [[ "$kind" == dec ]] && sub=load
+    if "$GATE_BIN" "$sub" "$v" >/dev/null 2>&1; then
         NUM="$v"
     else
         printf 'dcf-telemetry: %s is not a number (%q); publishing 0\n' "$name" "${v:0:40}" >&2
@@ -118,6 +190,7 @@ number() {
 # ============================================================================
 collect_metrics() {
     check_config
+    find_gate
     check_web_root
 
     # System metrics
@@ -238,6 +311,7 @@ collect_metrics() {
     fi
 
     if [[ "$valid" == "true" ]]; then
+        recheck_web_root
         chmod 644 "$TEMP_FILE"
         mv -f -- "$TEMP_FILE" "$OUTPUT_FILE"
         TEMP_FILE=""

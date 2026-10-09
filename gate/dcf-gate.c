@@ -23,9 +23,12 @@
  *       truncated one, and a prefix of an address is another address.
  *   dcf-gate port VALUE        exit 0 and echo VALUE if it is 1..65535
  *   dcf-gate interval VALUE    exit 0 and echo VALUE if it is 1..3600
+ *   dcf-gate number VALUE      exit 0 and echo VALUE if it is a JSON integer of 1..20 digits
+ *   dcf-gate load VALUE        exit 0 and echo VALUE if it is a load average (0.42, 12.5, 3)
+ *                              (the last two: watchdawg_gate, for dcf-telemetry.sh's JSON)
  *   dcf-gate selftest          known vectors through the same code
  *
- * Exit: 0 ok, 1 value refused (port/interval/selftest), 2 usage, 3 I/O error,
+ * Exit: 0 ok, 1 value refused (port/interval/number/load/selftest), 2 usage, 3 I/O error,
  * 70 the gate trapped (exsrt_abortus). The gate is written not to trap; if it
  * ever does, this host fails closed.
  */
@@ -38,6 +41,7 @@
 #include <unistd.h>
 
 #include "dcf_net_gate.gen.h"
+#include "watchdawg_gate.gen.h"
 
 #define DEFAULT_MAX 4096u
 #define LIMIT_MAX (1u << 20)
@@ -74,11 +78,18 @@ static uint64_t gate_class(const unsigned char head[16], uint64_t n)
   return exs_ordo_ipv4(buf, n);
 }
 
+/* which: 0 port, 1 interval (dcf_net_gate, 8-byte buffers); 2 number (20 bytes),
+ * 3 load (16 bytes) (watchdawg_gate). */
 static uint64_t gate_number(int which, const unsigned char *s, uint64_t n)
 {
-  unsigned char buf[8] = {0};
-  memcpy(buf, s, n < 8 ? (size_t)n : 8);
-  return which == 0 ? exs_admitte_portum(buf, n) : exs_admitte_intervallum(buf, n);
+  /* one buffer per kind, exactly the size its gate reads */
+  unsigned char b8[8] = {0}, b16[16] = {0}, b20[20] = {0};
+  switch (which) {
+  case 0: memcpy(b8, s, n < 8 ? (size_t)n : 8); return exs_admitte_portum(b8, n);
+  case 1: memcpy(b8, s, n < 8 ? (size_t)n : 8); return exs_admitte_intervallum(b8, n);
+  case 2: memcpy(b20, s, n < 20 ? (size_t)n : 20); return exs_admitte_numerum(b20, n);
+  default: memcpy(b16, s, n < 16 ? (size_t)n : 16); return exs_admitte_onus(b16, n);
+  }
 }
 
 /* ------------------------------------------------------------ ipv4 mode */
@@ -300,10 +311,19 @@ static int mode_number(int which, const char *name, int argc, char **argv)
   size_t n = strlen(v);
   uint64_t verdict = gate_number(which, (const unsigned char *)v, n);
   if (verdict != 0) {
-    static const char *const why[6] = { "admitted", "empty", "too long", "not all digits", "leading zero",
-                                        "out of range" };
-    fprintf(stderr, "dcf-gate: %s refused (%s); %s\n", name, verdict < 6 ? why[verdict] : "?",
-            which == 0 ? "want 1..65535" : "want 1..3600 seconds");
+    static const char *const why_dcf[6] = { "admitted", "empty", "too long", "not all digits", "leading zero",
+                                            "out of range" };
+    static const char *const why_num[5] = { "admitted", "empty", "too long", "not all digits", "leading zero" };
+    static const char *const why_onus[8] = { "admitted", "empty", "too long", "a byte outside [0-9.]",
+                                             "no digit before the dot", "leading zero",
+                                             "more than six integer digits", "bad fraction" };
+    const char *w = "?";
+    if (which <= 1 && verdict < 6) w = why_dcf[verdict];
+    else if (which == 2 && verdict < 5) w = why_num[verdict];
+    else if (which == 3 && verdict < 8) w = why_onus[verdict];
+    const char *want = which == 0 ? "want 1..65535" : which == 1 ? "want 1..3600 seconds"
+                     : which == 2 ? "want 1..20 digits, no leading zero" : "want digits, optionally . and 1..6 digits";
+    fprintf(stderr, "dcf-gate: %s refused (%s); %s\n", name, w, want);
     return 1;
   }
   printf("%s\n", v);
@@ -311,7 +331,7 @@ static int mode_number(int which, const char *name, int argc, char **argv)
 }
 
 struct vec { int fn; const char *in; size_t len; unsigned want; };
-/* fn 0 ipv4 verdict, 1 ordo class (255 = refused), 2 port, 3 interval */
+/* fn 0 ipv4 verdict, 1 ordo class (255 = refused), 2 port, 3 interval, 4 number, 5 load */
 static const struct vec vecs[] = {
   {0, "1.2.3.4", 7, 0}, {0, "255.255.255.255", 15, 0}, {0, "0.0.0.0", 7, 0}, {0, "", 0, 1},
   {0, "1.2.3.04", 8, 6}, {0, "1.2.3.08", 8, 6}, {0, "01.2.3.4", 8, 6}, {0, "1.2.3.256", 9, 7},
@@ -325,6 +345,11 @@ static const struct vec vecs[] = {
   {2, "7777", 4, 0}, {2, "1", 1, 0}, {2, "65535", 5, 0}, {2, "0", 1, 5}, {2, "65536", 5, 5},
   {2, "07777", 5, 4}, {2, "7777 accept", 11, 2}, {2, "", 0, 1}, {2, "-1", 2, 3}, {2, "777777", 6, 2},
   {3, "10", 2, 0}, {3, "1", 1, 0}, {3, "3600", 4, 0}, {3, "0", 1, 5}, {3, "3601", 4, 5}, {3, "010", 3, 4},
+  {4, "0", 1, 0}, {4, "18446744073709551615", 20, 0}, {4, "", 0, 1}, {4, "007", 3, 4}, {4, "1e5", 3, 3},
+  {4, "-1", 2, 3}, {4, "1,\"x\":2", 7, 3}, {4, "100000000000000000000", 21, 2}, {4, "1\n", 2, 3},
+  {5, "0.42", 4, 0}, {5, "12.5", 4, 0}, {5, "104.50", 6, 0}, {5, "3", 1, 0}, {5, ".5", 2, 4}, {5, "00.5", 4, 5},
+  {5, "1234567.1", 9, 6}, {5, "1.", 2, 7}, {5, "1.2.3", 5, 7}, {5, "1.1234567", 9, 7}, {5, "nan", 3, 3},
+  {5, "0.42,\"injected\":true", 20, 2},
 };
 
 static int mode_selftest(void)
@@ -339,7 +364,7 @@ static int mode_selftest(void)
       memcpy(head, v->in, v->len < 16 ? v->len : 16);
       got = v->fn == 0 ? gate_ipv4(head, v->len) : gate_class(head, v->len);
     } else {
-      got = gate_number(v->fn == 2 ? 0 : 1, (const unsigned char *)v->in, v->len);
+      got = gate_number(v->fn - 2, (const unsigned char *)v->in, v->len);
     }
     if (got != v->want) {
       fprintf(stderr, "dcf-gate: selftest: vector %zu (fn %d, \"%s\") gave %llu, wanted %u\n", i, v->fn, v->in,
@@ -361,9 +386,11 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "ipv4")) return mode_ipv4(argc, argv);
     if (!strcmp(argv[1], "port")) return mode_number(0, "port", argc, argv);
     if (!strcmp(argv[1], "interval")) return mode_number(1, "interval", argc, argv);
+    if (!strcmp(argv[1], "number")) return mode_number(2, "number", argc, argv);
+    if (!strcmp(argv[1], "load")) return mode_number(3, "load", argc, argv);
     if (!strcmp(argv[1], "selftest")) return mode_selftest();
   }
   fputs("usage: dcf-gate ipv4 [--hex] [--max N] [--report N] < lines\n"
-        "       dcf-gate port VALUE | interval VALUE | selftest\n", stderr);
+        "       dcf-gate port VALUE | interval VALUE | number VALUE | load VALUE | selftest\n", stderr);
   return 2;
 }

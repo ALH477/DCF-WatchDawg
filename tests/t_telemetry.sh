@@ -49,12 +49,28 @@ names=$(status '[.peers[].username] | sort' | python3 -c 'import json,sys; print
 want=$(python3 -c 'import json; print(json.dumps(sorted(["a\"quote","back\\slash","nl\nname","ctl\u0001\u001f","uni\u00e9\u65e5"])))')
 assert_eq "usernames with quotes, backslashes, newlines, control characters and unicode survive as valid JSON" "$want" "$names"
 
+# ---- the gate that vets the numbers runs as root: it must be there, and safe
+fresh_web; telemetry DCF_GATE=/nonexistent/dcf-gate
+if [[ $TRC -eq 69 && ! -e "$web/status.json" ]]; then ok "gate: a missing DCF_GATE is refused with exit 69, nothing published"
+else bad "gate: a missing DCF_GATE is refused with exit 69, nothing published" "rc=$TRC $TOUT"; fi
+mkdir -m 777 "$TMP/gate_bad"; cp "$T_ROOT/gate/dcf-gate" "$TMP/gate_bad/dcf-gate"
+fresh_web; telemetry DCF_GATE="$TMP/gate_bad/dcf-gate"
+if [[ $TRC -eq 69 && ! -e "$web/status.json" ]]; then ok "gate: a gate in a world-writable directory is refused with exit 69"
+else bad "gate: a gate in a world-writable directory is refused with exit 69" "rc=$TRC $TOUT"; fi
+
 # ---- W6: the directory itself
 fresh_web
 mkdir "$TMP/real"; rm -rf -- "$web"; ln -s "$TMP/real" "$web"
 telemetry
 if [[ $TRC -ne 0 && ! -e "$TMP/real/status.json" ]]; then ok "W6 WEB_ROOT that is a symlink is refused"
 else bad "W6 WEB_ROOT that is a symlink is refused" "rc=$TRC $(ls -la "$TMP/real")"; fi
+rm -f -- "$web"
+
+# a trailing slash must not hide the link
+rm -rf -- "$web" "$TMP/real"; mkdir "$TMP/real"; ln -s "$TMP/real" "$web"
+TOUT=$(env WEB_ROOT="$web/" bash "$TELEMETRY" 2>&1); TRC=$?
+if [[ $TRC -ne 0 && ! -e "$TMP/real/status.json" ]]; then ok "W6 WEB_ROOT that is a symlink is refused even with a trailing slash"
+else bad "W6 WEB_ROOT that is a symlink is refused even with a trailing slash" "rc=$TRC $(ls -la "$TMP/real")"; fi
 rm -f -- "$web"
 
 fresh_web; chmod 777 "$web"

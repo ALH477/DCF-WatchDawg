@@ -38,6 +38,6 @@ nft flush ruleset; nft add table ip t; nft add set ip t s '{ type ipv4_addr; }'
 nft add chain ip t input '{ type filter hook input priority 0; policy accept; }'
 nft add rule ip t input udp dport 7777 accept '#' ip saddr @s accept
 rules=$(nft list chain ip t input | grep -E '^\s+udp')
-assert_eq "an argv word '#' comments out the rest of the rule: 'udp dport 7777 accept #...' is an unconditional accept" "udp dport 7777 accept" "$(sed 's/^[[:space:]]*//' <<<"$rules")"
+assert_eq "an argv word '#' comments out the rest of the rule: 'udp dport 7777 accept #...' is an unconditional accept" "udp dport 7777 accept" "${rules#"${rules%%[![:space:]]*}"}"
 
 t_finish

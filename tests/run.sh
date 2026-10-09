@@ -3,6 +3,7 @@
 #
 #   tests/run.sh                 everything
 #   tests/run.sh t_sync t_vip    just those
+#   DCF_TEST_FAST=1 tests/run.sh everything except the (slow) host-mutant run
 #   make test                    same as tests/run.sh
 #
 # Needs: bash, python3 (sqlite3 module, for fixture databases), the sqlite3 CLI,
@@ -35,7 +36,10 @@ if [[ $# -gt 0 ]]; then
 else
     names=()
     for f in tests/t_*.sh tests/t_*.py; do
-        [[ -e "$f" ]] && names+=("$(basename "${f%.*}")")
+        [[ -e "$f" ]] || continue
+        # DCF_TEST_FAST=1 leaves out the host-mutant run (about two minutes of the suite's three)
+        [[ "${DCF_TEST_FAST:-}" == 1 && "$f" == tests/t_gate_mutants.py ]] && continue
+        names+=("$(basename "${f%.*}")")
     done
 fi
 
@@ -55,6 +59,12 @@ for n in "${names[@]}"; do
     total_pass=$((total_pass + ${p:-0})); total_fail=$((total_fail + ${f:-0})); total_skip=$((total_skip + ${s:-0}))
     if [[ $rc -ne 0 ]]; then fail=1; summary+=("FAIL $n (exit $rc)"); else summary+=("ok   $n"); fi
 done
+
+# the vendored C is what exsc emits (skips, saying so, without an Exsecutor checkout)
+if [[ $# -eq 0 ]]; then
+    echo "== check-gate-fresh"
+    if scripts/check-gate-fresh.sh; then summary+=("ok   check-gate-fresh"); else fail=1; summary+=("FAIL check-gate-fresh"); fi
+fi
 
 # lint, when shellcheck is around (and the whole suite was asked for)
 if command -v shellcheck >/dev/null 2>&1 && [[ $# -eq 0 ]]; then
