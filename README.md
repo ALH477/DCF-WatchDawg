@@ -403,15 +403,20 @@ scripts *send*, skips the rest and says so. Each test file prints its mode.
 Run (mode `real`, nft 1.0.9, kernel 6.18, bash 5.2, sqlite3 CLI 3.53.3 and
 python's libsqlite 3.45.1, jq 1.7, shellcheck 0.11, gcc 13):
 
-* `tests/run.sh` (everything): **340 checks pass, 0 fail, 0 skip** (2.5 minutes).
-  `DCF_TEST_NFT_MODE=shim tests/run.sh` on the nft-dependent files: 113 pass, 0 fail,
-  10 skipped as needing a real nft.
+* `tests/run.sh` (everything): **468 checks pass, 0 fail, 0 skip** (under four
+  minutes). `DCF_TEST_NFT_MODE=shim tests/run.sh` on the nft-dependent files:
+  139 pass, 0 fail, 12 skipped as needing a real nft.
 * The tests for W1-W7 were written first and **failed** on the unmodified
   scripts: 94 of the 131 checks that existed when they were first committed
-  (commit `1749a8f`), and 104 of the 146 in the same six files as they stand now
+  (commit `1749a8f`), and 104 of the 146 in the same six files as they stood after
+  the first pass
   (`WATCHDOG=` and `TELEMETRY=` point the suite at any copy of the scripts; the
   old copies are `git show 1749a8f:dcf-watchdog.sh` and `...:dcf-telemetry.sh`).
   They pass after the fixes.
+* The tests for the second review (R1-R5) were committed first too (`ad3e250`) and
+  **failed** on the code of `a4ecad9`: 59 of 235 checks in seven files; they pass
+  now. R1's are packet-level: a UDP datagram is sent from a source address through
+  the input hook (`tests/udp.py`, no iproute2) and must arrive or not.
 * Exsecutor's own suites for the two vendored units, against the compiler build
   recorded in `gate/PROVENANCE.md`: `examples/dcf_net_gate/proba_c.sh` and
   `examples/watchdawg_gate/proba_c.sh` (the second: 696,610 cases, 16 mutants).
