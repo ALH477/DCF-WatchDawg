@@ -1,0 +1,3 @@
+# built by `make -C gate`; the vendored C is what is committed
+/gate/dcf-gate
+/gate/*.o
