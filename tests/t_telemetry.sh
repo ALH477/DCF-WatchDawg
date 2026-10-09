@@ -58,6 +58,19 @@ fresh_web; telemetry DCF_GATE="$TMP/gate_bad/dcf-gate"
 if [[ $TRC -eq 69 && ! -e "$web/status.json" ]]; then ok "gate: a gate in a world-writable directory is refused with exit 69"
 else bad "gate: a gate in a world-writable directory is refused with exit 69" "rc=$TRC $TOUT"; fi
 
+# ---- no JSON validator on the machine: fail closed, do not publish unchecked text
+nov=$TMP/novalidator; mkdir -m 755 "$nov"
+for t in cut free awk ip cat nft grep wc sqlite3 date mktemp stat readlink dirname chmod mv rm id; do
+    real=$(command -v "$t" 2>/dev/null) && ln -s "$real" "$nov/$t"
+done
+fresh_web; telemetry DCF_PATH="$nov"
+if [[ $TRC -ne 0 && ! -e "$web/status.json" ]]; then ok "no jq and no python3: nothing is published (fail closed)"
+else bad "no jq and no python3: nothing is published (fail closed)" "rc=$TRC $(ls -la "$web")"; fi
+assert_has "... and the message says why" "$TOUT" "no JSON validator"
+ln -s "$(command -v jq)" "$nov/jq"
+fresh_web; telemetry DCF_PATH="$nov"
+assert_eq "with jq back on the path, status.json is published" "0 yes" "$TRC $([[ -f "$web/status.json" ]] && echo yes || echo no)"
+
 # ---- W6: the directory itself
 fresh_web
 mkdir "$TMP/real"; rm -rf -- "$web"; ln -s "$TMP/real" "$web"
@@ -107,7 +120,7 @@ echo "default via 10.0.0.1 dev ../../../../../..$TMP/fakeif"
 SH
 chmod +x "$TMP/shim/"*
 fresh_web
-telemetry PATH="$TMP/shim:$PATH"
+telemetry PATH="$TMP/shim:$PATH" DCF_PATH="$TMP/shim:$T_TOOLPATH"
 if grep -q 'injected' "$web/status.json" 2>/dev/null; then
     bad "W6 numeric: text read from the system cannot add fields to status.json" "$(cat "$web/status.json")"
 else
@@ -142,7 +155,7 @@ exec $(command -v sqlite3) "\$@"
 SH
 chmod +x "$TMP/shim/sqlite3"
 : > "$TMP/sqlite3.argv"
-fresh_web; telemetry PATH="$TMP/shim:$PATH"
+fresh_web; telemetry PATH="$TMP/shim:$PATH" DCF_PATH="$TMP/shim:$T_TOOLPATH"
 if [[ -s "$TMP/sqlite3.argv" ]] && ! grep -qvx -e '-readonly' "$TMP/sqlite3.argv"; then ok "W6 every sqlite3 call in telemetry passes -readonly"
 else bad "W6 every sqlite3 call in telemetry passes -readonly" "$(cut -c1-120 "$TMP/sqlite3.argv")"; fi
 rm -f "$TMP/shim/sqlite3"

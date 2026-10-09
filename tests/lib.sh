@@ -45,6 +45,13 @@ t_start() {
     fi
     TMP=$(mktemp -d)
     trap t_cleanup EXIT
+    # The scripts under test pin PATH to the system directories, plus DCF_PATH if
+    # it is set (each entry checked as a root-only directory). This sandbox keeps
+    # sqlite3 in a nix store directory, so DCF_PATH names it first. PATH itself is
+    # left alone so that the scripts as they were (WATCHDOG=old copy) still run.
+    T_SYSPATH=/usr/sbin:/usr/bin:/sbin:/bin
+    T_TOOLPATH=$(dirname "$(command -v sqlite3)"):$T_SYSPATH
+    export DCF_PATH=$T_TOOLPATH
     if [[ "$DCF_TEST_NFT_MODE" == shim ]]; then
         mkdir -p "$TMP/bin"
         cp "$T_DIR/nft-shim.sh" "$TMP/bin/nft"
@@ -52,6 +59,7 @@ t_start() {
         export NFT_SHIM_LOG="$TMP/nft.log"
         : > "$NFT_SHIM_LOG"
         export PATH="$TMP/bin:$PATH"
+        export DCF_PATH="$TMP/bin:$T_TOOLPATH"
     fi
     echo "# $(basename "$0") mode: $DCF_TEST_NFT_MODE"
 }
@@ -130,6 +138,19 @@ fault_path() {
     cp "$T_DIR/nft-fault.sh" "$TMP/fbin/nft"; chmod +x "$TMP/fbin/nft"
     # shellcheck disable=SC2034  # read by the tests that source this file
     FAULT_PATH="$TMP/fbin:$PATH"
+    # shellcheck disable=SC2034
+    FAULT_DCF_PATH="$TMP/fbin:$DCF_PATH"
 }
 fault_reset() { find "$NFT_FAULT_DIR" -type f -delete; }
 fault_calls() { cat "$NFT_FAULT_DIR/calls" 2>/dev/null | wc -l; }
+
+# ---------------------------------------------------------------- packets
+# net_up ADDR...: bring lo up in this namespace and give it the addresses
+# (real mode only; the probes below send real datagrams through the input hook)
+net_up() { python3 "$T_DIR/udp.py" up "$@"; }
+# probe SRC: send one UDP datagram from SRC to a listener on :7777 -> "RX" or "NORX"
+probe() { python3 "$T_DIR/udp.py" probe "$1" 7777; }
+# set_flags SET: the "flags ..." line of a set, e.g. "flags interval,timeout"
+set_flags() { nft list set ip dcf_firewall "$1" 2>/dev/null | grep -E '^[[:space:]]*flags' | sed 's/^[[:space:]]*//'; }
+# table_shape: the table's chains and sets, one per line, without contents
+table_shape() { nft list table ip dcf_firewall 2>/dev/null | grep -E '^[[:space:]]*(chain|set) ' | sed 's/^[[:space:]]*//' | sort; }

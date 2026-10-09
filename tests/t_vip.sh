@@ -75,14 +75,14 @@ assert_eq "no users table (query error): vip_permanent kept, not flushed" "8.8.8
 nft_reset
 mkdb "$db" '["vip","8.8.8.8","now",0,0,1]' '["bob","8.8.4.4","now",0,0,0]'
 fault_reset
-out=$(PATH=$FAULT_PATH NFT_FAIL_STDIN_RE='element ip dcf_firewall vip_permanent' NFT_FAIL_MSG='synthetic-vip-failure' wd_once)
+out=$(PATH=$FAULT_PATH DCF_PATH=$FAULT_DCF_PATH NFT_FAIL_STDIN_RE='^flush set ip dcf_firewall vip_permanent' NFT_FAIL_MSG='synthetic-vip-failure' wd_once)
 if grep '"level":"error"' <<<"$out" | grep -q 'synthetic-vip-failure'; then ok "a refused VIP update is logged as an error with nft's text"
 else bad "a refused VIP update is logged as an error with nft's text" "$out"; fi
 
 nft_reset
 mkdb "$db" '["bob","8.8.4.4","now",0,0,0]'
 fault_reset
-out=$(PATH=$FAULT_PATH NFT_FAIL_STDIN_RE='element ip dcf_firewall whitelist' NFT_FAIL_MSG='synthetic-wl-failure' wd_once)
+out=$(PATH=$FAULT_PATH DCF_PATH=$FAULT_DCF_PATH NFT_FAIL_STDIN_RE='^flush set ip dcf_firewall whitelist' NFT_FAIL_MSG='synthetic-wl-failure' wd_once)
 if grep '"level":"error"' <<<"$out" | grep -q 'synthetic-wl-failure'; then ok "a refused whitelist update is logged as an error with nft's text"
 else bad "a refused whitelist update is logged as an error with nft's text" "$out"; fi
 
@@ -90,7 +90,7 @@ else bad "a refused whitelist update is logged as an error with nft's text" "$ou
 nft_reset
 mkdb "$db" '["nobody",null,"now",0,0,0]'
 fault_reset
-out=$(PATH=$FAULT_PATH NFT_FAIL_STDIN_RE='flush set ip dcf_firewall (whitelist|vip_permanent)' NFT_FAIL_MSG='synthetic-flush-failure' wd_once)
+out=$(PATH=$FAULT_PATH DCF_PATH=$FAULT_DCF_PATH NFT_FAIL_STDIN_RE='flush set ip dcf_firewall (whitelist|vip_permanent)' NFT_FAIL_MSG='synthetic-flush-failure' wd_once)
 if grep '"level":"error"' <<<"$out" | grep -q 'synthetic-flush-failure'; then ok "a refused flush (empty result) is logged as an error with nft's text"
 else bad "a refused flush (empty result) is logged as an error with nft's text" "$out"; fi
 

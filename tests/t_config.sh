@@ -75,6 +75,8 @@ nft_reset
 run DCF_GATE=/nonexistent/dcf-gate; assert_eq "gate: a missing DCF_GATE is refused with exit 69" 69 "$RC"
 mkdir -m 777 "$TMP/gate_bad"; cp "$T_ROOT/gate/dcf-gate" "$TMP/gate_bad/dcf-gate"
 run DCF_GATE="$TMP/gate_bad/dcf-gate"; assert_eq "gate: a gate in a world-writable directory is refused with exit 69" 69 "$RC"
+assert_has "gate: the message names the offending directory" "$RUN_OUT" "$TMP/gate_bad"
+assert_has "gate: ... and the fix" "$RUN_OUT" "chmod g-w,o-w $TMP/gate_bad"
 chmod 755 "$TMP/gate_bad"; chmod 777 "$TMP/gate_bad/dcf-gate"
 run DCF_GATE="$TMP/gate_bad/dcf-gate"; assert_eq "gate: a world-writable gate is refused with exit 69" 69 "$RC"
 if nft_untouched; then ok "gate: ... and nothing was installed"; else bad "gate: ... and nothing was installed"; fi

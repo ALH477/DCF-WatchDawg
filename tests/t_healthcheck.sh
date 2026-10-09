@@ -26,6 +26,14 @@ nft_reset; DCF_PORT=7777 wd_once >/dev/null
 DCF_PORT=7778 hc; assert_eq "rules are for another port than DCF_PORT: unhealthy" 1 "$RC"
 DCF_PORT='7777 accept' hc; assert_eq "a DCF_PORT that is not a port: unhealthy" 1 "$RC"
 
+# DCF_PORT is judged by the same gate as the daemon's (1..65535), not a looser pattern
+DCF_PORT=70000 hc; assert_eq "DCF_PORT=70000 is refused" 1 "$RC"
+assert_has "... by the gate, with its reason" "$OUT" "refused by dcf-gate"
+DCF_PORT=07777 hc; assert_eq "DCF_PORT=07777 (leading zero) is refused" 1 "$RC"
+assert_has "... by the gate" "$OUT" "refused by dcf-gate"
+DCF_GATE=/nonexistent/dcf-gate hc; assert_eq "an explicit but missing DCF_GATE is unhealthy" 1 "$RC"
+assert_has "... and says so" "$OUT" "dcf-gate"
+
 # telemetry configured: status.json freshness
 nft_reset; TELEMETRY_SCRIPT=$T_ROOT/dcf-telemetry.sh wd_once >/dev/null
 TELEMETRY_SCRIPT=x hc; assert_eq "telemetry configured and status.json fresh: healthy" 0 "$RC"
